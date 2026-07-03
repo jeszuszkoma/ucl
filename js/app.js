@@ -268,6 +268,10 @@ function matchCard(m) {
   const ko = isKnockout(m);
   const picks = votesFor(m);
   const locked = !open;
+  // Hit/miss coloring only once the match is decided — a live running score
+  // would paint picks wrong (KO at 1:1 makes outcome 'X', nobody's pick), and
+  // a KO tie at FT stays undecided until pens reach the feed.
+  const decided = st === 'finished' && !!res && !(ko && res === 'X');
 
   const opts = ko ? ['1', '2'] : ['1', 'X', '2'];
   const voteBtns = opts.map(o => {
@@ -276,7 +280,7 @@ function matchCard(m) {
     const cls = [
       'vote-btn',
       isMine ? 'mine' : '',
-      locked && res ? (o === res ? 'hit' : isMine ? 'miss' : '') : '',
+      decided ? (o === res ? 'hit' : isMine ? 'miss' : '') : '',
     ].join(' ');
     const label = o === '1' ? (ko ? teamShort(m.team1) : '1')
                 : o === '2' ? (ko ? teamShort(m.team2) : '2') : 'X';
@@ -305,9 +309,11 @@ function matchCard(m) {
       </div>`
     : '';
   const gl = guessesFor(m);
+  // ✓ only after FT — a live running score would flash exact hits mid-match.
+  const xh = g => st === 'finished' && exactHit(m, g);
   const guessReveal = locked && gl.length
     ? `<div class="picks-line">${gl.map(({ player, g }) =>
-        `<span class="pick-tag ${exactHit(m, g) ? 'ghit' : ''}">${esc(player)} ${g[0]}:${g[1]}${exactHit(m, g) ? ' ✓' : ''}</span>`).join('')}</div>`
+        `<span class="pick-tag ${xh(g) ? 'ghit' : ''}">${esc(player)} ${g[0]}:${g[1]}${xh(g) ? ' ✓' : ''}</span>`).join('')}</div>`
     : '';
 
   const score = g
