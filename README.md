@@ -6,6 +6,11 @@ you're right, top the board.
 
 **Live:** https://jeszuszkoma.github.io/wc26/
 
+> **Status (2026-07-20):** tournament over — the site now shows a holding page
+> with the final top 3. Game data has been cleared from Supabase (local backup
+> kept). The app itself is untouched (`js/`, `css/`, `data/`) — to bring it
+> back, restore `index.html` from the last pre-holding commit.
+
 - All 12 groups, 104 matches, knockout bracket — times shown in your timezone
 - Shared voting via Supabase (optional — works locally without it)
 - Scores from [openfootball](https://github.com/openfootball/worldcup.json) (~daily),
