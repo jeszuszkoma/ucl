@@ -270,7 +270,7 @@ function ballotBar(phase) {
   const sending = state.submitting;
   const complete = total > 0 && picked === total && !sending;
   const hint = completeHint(phase);
-  const note = online() ? ' <span class="bb-note">· draft stays on this device until SUBMIT</span>' : '';
+  const note = online() ? ' <span class="bb-note">· draft stays on this device until SUBMIT · submit is final</span>' : '';
   return `<div class="ballot-bar open">
     <div class="bb-text">🗳 ${label} BALLOT OPEN · <b>${picked}/${total}</b> picked · locks ${lock}${note}</div>
     <button class="submit-ballot" data-phase="${esc(phase)}" ${complete ? '' : 'disabled'}
@@ -757,7 +757,6 @@ document.addEventListener('click', async e => {
     const { picked, total } = pickedCount(phase);
     if (picked !== total) { toast(completeHint(phase)); return; }
     if (state.submitting) return;
-    if (!confirm(`Submit your ${ballot(phase)?.label ?? phase} ballot?\n\nFINAL — no changes afterwards.`)) return;
     const key = `${phase}:${myId()}`;
     // The whole ballot goes in one request: every pick of a match phase, or
     // the one pick of a trophy ballot. Nothing was sent before this point.
