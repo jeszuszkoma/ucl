@@ -1,0 +1,22 @@
+# Only the properties declared here are pushed (`supabase config push`);
+# everything else in the hosted project stays as it is. Preview with
+# `supabase config diff`. SMTP must still be set in the dashboard.
+project_id = "wc26"
+
+[auth]
+site_url = "https://jeszuszkoma.github.io/wc26/"
+additional_redirect_urls = ["https://jeszuszkoma.github.io/wc26/", "http://localhost:8087/"]
+
+[auth.email]
+enable_signup = true
+enable_confirmations = true
+double_confirm_changes = true
+
+[auth.rate_limit]
+# username logins reach GoTrue from the edge function's IP, so per-IP limits
+# must cover the whole friend group
+token_refresh = 600
+sign_in_sign_ups = 300
+
+[functions.login]
+verify_jwt = false

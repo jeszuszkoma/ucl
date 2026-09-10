@@ -1,52 +1,56 @@
 import { CONFIG } from './config.js';
-import { TEAMS, flag } from './teams.js';
+import { TEAMS, crest, teamShort, isPlaceholder } from './teams.js';
 import {
-  loadSchedule, refreshScores, kickoff, status, votingOpen, placeholder,
-  unlockTime, isKnockout, goals, goals90, outcome, standings, topScorers, KO_ROUNDS,
-  fetchTopScorers,
+  loadSchedule, refreshScores, fetchStandings, standings, kickoff, scheduledKickoff, status, options,
+  outcome, goals, topScorers, isKnockout, isWinnerOnly, placeholder, KO_ROUNDS, PHASE_LABEL,
 } from './data.js';
 import {
-  online, playerName, setPlayerName, fetchVotes, castVote, playersFrom,
-  fetchSpecials, saveSpecial, fetchGuesses, castGuess,
-  claimPlayer, isClaimed, setClaimed,
-} from './votes.js';
+  online, currentUser, signup, login, logout, recover, resend, updatePassword, handleAuthHash,
+  loadProfile, setLocalName, describe, AuthError,
+} from './auth.js';
+import { fetchState, fetchBallots, savePick, submitPhase, saveTrophy } from './picks.js';
 
 const $ = sel => document.querySelector(sel);
 
+// Bumped before every optimistic write; a background state snapshot that
+// started before the bump must not clobber the player's own fresh rows.
+let writeSeq = 0;
+
 const state = {
   matches: [],
-  votes: {},        // "num:player" -> pick
-  guesses: {},      // "num:player" -> [home, away]
-  specials: {},     // player -> { champion, final_score, top_scorer }
-  champPick: null,  // champion selection awaiting OK (not saved yet)
-  scorerPick: null, // gólkirály selection awaiting OK
-  scorerCustom: false, // free-text scorer input open
+  ballots: {},      // phase -> { label, opens_at, locks_at }
+  profiles: {},     // user_id -> username
+  picks: {},        // "num:user_id" -> '1' | 'X' | '2'
+  submissions: {},  // "phase:user_id" -> iso
+  trophy: {},       // user_id -> { champion, top_scorer }
+  table: null,      // ESPN standings rows, or null -> computed
   view: 'matches',
   now: new Date(),
-  autoScrolled: false, // have we jumped to the focus match yet this matches-view visit
-  scoresLoaded: false, // first refreshScores done — layout is stable enough to jump
-  scorerRace: [],   // live tournament top-scorer tally from ESPN [{name, goals}]
+  scorerCustom: false,
+  scoresLoaded: false,
+  autoScrolled: false,
+  stateLoaded: false,
+  authMode: null,   // null | 'login' | 'register' | 'forgot' | 'resend' | 'reset' | 'sent' | 'local'
+  authBusy: false,
+  pendingWrites: 0, // picks / trophy saves in flight (SUBMIT waits for them)
 };
 
-// Gólkirály shortlist: realistic Golden Boot candidates from qualified teams.
-// "OTHER" opens a free-text field for everyone else.
+// Gólkirály shortlist. OTHER… opens free text for anyone else.
 const SCORERS = [
-  ['Kylian Mbappé', 'France'], ['Erling Haaland', 'Norway'],
-  ['Harry Kane', 'England'], ['Lionel Messi', 'Argentina'],
-  ['Lautaro Martínez', 'Argentina'], ['Julián Álvarez', 'Argentina'],
-  ['Vinícius Júnior', 'Brazil'], ['Raphinha', 'Brazil'], ['Endrick', 'Brazil'],
-  ['Lamine Yamal', 'Spain'], ['Mikel Oyarzabal', 'Spain'],
-  ['Jamal Musiala', 'Germany'], ['Florian Wirtz', 'Germany'],
-  ['Kai Havertz', 'Germany'], ['Jude Bellingham', 'England'],
-  ['Bukayo Saka', 'England'], ['Cristiano Ronaldo', 'Portugal'],
-  ['Rafael Leão', 'Portugal'], ['Cody Gakpo', 'Netherlands'],
-  ['Memphis Depay', 'Netherlands'], ['Romelu Lukaku', 'Belgium'],
-  ['Darwin Núñez', 'Uruguay'], ['Luis Díaz', 'Colombia'],
-  ['Mohamed Salah', 'Egypt'], ['Sadio Mané', 'Senegal'],
-  ['Son Heung-min', 'South Korea'], ['Santiago Giménez', 'Mexico'],
-  ['Raúl Jiménez', 'Mexico'], ['Jonathan David', 'Canada'],
-  ['Christian Pulisic', 'USA'], ['Ayoub El Kaabi', 'Morocco'],
-  ['Marcus Thuram', 'France'],
+  ['Kylian Mbappé', 'Real Madrid'], ['Vinícius Júnior', 'Real Madrid'],
+  ['Erling Haaland', 'Manchester City'], ['Harry Kane', 'Bayern Munich'],
+  ['Robert Lewandowski', 'Barcelona'], ['Lamine Yamal', 'Barcelona'], ['Raphinha', 'Barcelona'],
+  ['Mohamed Salah', 'Liverpool'], ['Alexander Isak', 'Liverpool'],
+  ['Ousmane Dembélé', 'Paris Saint-Germain'], ['Bradley Barcola', 'Paris Saint-Germain'],
+  ['Julián Álvarez', 'Atlético Madrid'], ['Antoine Griezmann', 'Atlético Madrid'],
+  ['Viktor Gyökeres', 'Arsenal'], ['Bukayo Saka', 'Arsenal'],
+  ['Lautaro Martínez', 'Internazionale'], ['Marcus Thuram', 'Internazionale'],
+  ['Serhou Guirassy', 'Borussia Dortmund'], ['Victor Osimhen', 'Galatasaray'],
+  ['Benjamin Šeško', 'Manchester United'], ['Ollie Watkins', 'Aston Villa'],
+  ['Rasmus Højlund', 'Napoli'], ['Samu Aghehowa', 'FC Porto'],
+  ['Youssef En-Nesyri', 'Fenerbahce'], ['Michael Olise', 'Bayern Munich'],
+  ['Florian Wirtz', 'Liverpool'], ['Jude Bellingham', 'Real Madrid'],
+  ['Cody Gakpo', 'Liverpool'], ['Nick Woltemade', 'VfB Stuttgart'],
 ];
 
 // Accent/case-insensitive compare for free-text scorer picks.
@@ -54,107 +58,103 @@ const norm = s => (s ?? '').normalize('NFD').replace(/\p{M}/gu, '').toLowerCase(
 
 /* ---------- helpers ---------- */
 
-const GROUPS = 'ABCDEFGHIJKL'.split('').map(c => `Group ${c}`);
-
-function slotLabel(slot) {
-  let m = slot.match(/^(\d)([A-L])$/);
-  if (m) return `${['1st', '2nd', '3rd'][m[1] - 1]} ${m[2]}`;
-  m = slot.match(/^W(\d+)$/);
-  if (m) return `Winner ${m[1]}`;
-  m = slot.match(/^L(\d+)$/);
-  if (m) return `Loser ${m[1]}`;
-  m = slot.match(/^3([A-L/]+)$/);
-  if (m) return `3rd ${m[1]}`;
-  return slot;
+function esc(s) {
+  return String(s ?? '').replace(/[&<>"']/g, c => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+  }[c]));
 }
-
-function teamLabel(name) {
-  return placeholderName(name) ? slotLabel(name) : name;
-}
-function placeholderName(name) {
-  return /^([WL]\d+|\d[A-L])$|\//.test(name);
-}
-
 function fmtTime(m) {
   return kickoff(m).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 }
 function fmtDay(d) {
   return d.toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric' });
 }
-function esc(s) {
-  return String(s).replace(/[&<>"']/g, c => ({
-    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
-  }[c]));
+function fmtDeadline(d) {
+  return d.toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
 }
+function teamLabel(name) {
+  return isPlaceholder(name) ? name : teamShort(name);
+}
+const me = () => currentUser();
+const myId = () => me()?.id ?? null;
 
 function myPick(m) {
-  return state.votes[`${m.num}:${playerName()}`] ?? null;
+  const id = myId();
+  return id ? state.picks[`${m.num}:${id}`] ?? null : null;
 }
-
-function myGuess(m) {
-  return state.guesses[`${m.num}:${playerName()}`] ?? null;
-}
-
-function guessesFor(m) {
-  const out = [];
-  const prefix = `${m.num}:`;
-  for (const [key, g] of Object.entries(state.guesses)) {
-    if (key.startsWith(prefix)) out.push({ player: key.slice(prefix.length), g });
-  }
-  return out.sort((a, b) => a.player.localeCompare(b.player));
-}
-
-// EXACT judges on the 90-minute score, betting style — ET goals don't count.
-function exactHit(m, g) {
-  const res = goals90(m);
-  return res && g && g[0] === res.home && g[1] === res.away;
-}
-
-function votesFor(m) {
+function picksFor(m) {
   const out = { 1: [], X: [], 2: [] };
   const prefix = `${m.num}:`;
-  for (const [key, pick] of Object.entries(state.votes)) {
-    if (key.startsWith(prefix)) out[pick]?.push(key.slice(prefix.length));
+  for (const [key, pick] of Object.entries(state.picks)) {
+    if (key.startsWith(prefix)) out[pick]?.push(state.profiles[key.slice(prefix.length)] ?? '?');
   }
+  for (const k of Object.keys(out)) out[k].sort((a, b) => a.localeCompare(b));
   return out;
+}
+
+/* ---------- ballots ---------- */
+
+function ballot(phase) { return state.ballots[phase] ?? null; }
+
+// 'none' | 'upcoming' | 'open' | 'submitted' | 'locked'
+function ballotState(phase) {
+  const b = ballot(phase);
+  if (!b) return 'none';
+  if (state.now < new Date(b.opens_at)) return 'upcoming';
+  if (state.now >= new Date(b.locks_at)) return 'locked';
+  const id = myId();
+  if (id && state.submissions[`${phase}:${id}`]) return 'submitted';
+  return 'open';
+}
+// Membership uses the bundled kickoff (same as the server's matches table), not
+// ESPN's live one, so the browser and the RLS policy always agree.
+function inBallot(m) {
+  const b = ballot(m.phase);
+  return Boolean(b) && scheduledKickoff(m) >= new Date(b.locks_at);
+}
+function canPick(m) {
+  return inBallot(m) && ballotState(m.phase) === 'open' && !placeholder(m);
+}
+function revealed(m) {
+  return ballotState(m.phase) === 'locked';
+}
+function ballotMatches(phase) {
+  return state.matches.filter(m => m.phase === phase && inBallot(m));
+}
+// Progress towards SUBMIT. The league ballot also needs the two trophy picks
+// (they share its lock, and SUBMIT freezes them too).
+function pickedCount(phase) {
+  const ms = ballotMatches(phase);
+  let picked = ms.filter(m => myPick(m)).length, total = ms.length;
+  if (phase === 'league' && total) {
+    const t = myTrophy();
+    total += 2;
+    picked += (t.champion ? 1 : 0) + (t.top_scorer ? 1 : 0);
+  }
+  return { picked, total };
 }
 
 /* ---------- tournament specials ---------- */
 
 function finalMatch() {
-  return state.matches.find(m => m.round === 'Final');
+  return state.matches.find(m => m.phase === 'final');
 }
-function firstKnockoff() {
-  // champion picks lock when the knockout stage begins
-  const ko = state.matches.filter(isKnockout).sort((a, b) => kickoff(a) - kickoff(b));
-  return ko[0];
-}
-// Champion team name once the final is decided, else null.
-function worldChampion() {
+// Champion once the final is decided, else null.
+function champion() {
   const f = finalMatch();
   if (!f || placeholder(f)) return null;
   const res = outcome(f);
-  if (!res || f._live) return null;
+  if (!res || res === 'X' || f._live) return null;
   return res === '1' ? f.team1 : f.team2;
 }
-function mySpecial() {
-  return state.specials[playerName()] ?? { champion: null, final_score: null, top_scorer: null };
+function myTrophy() {
+  const id = myId();
+  return (id && state.trophy[id]) || { champion: null, top_scorer: null };
 }
-
-// Champion + gólkirály picks close at Netherlands–Japan kickoff (Sun Jun 14,
-// 22:00 CEST) — Márk's rule, well before knockout so group form can't be ridden.
-function specialsDeadline() {
-  const m = state.matches.find(x =>
-    (x.team1 === 'Netherlands' && x.team2 === 'Japan') ||
-    (x.team1 === 'Japan' && x.team2 === 'Netherlands'));
-  return m ? kickoff(m) : new Date('2026-06-14T22:00:00+02:00');
-}
-
-// Winner(s) of the gólkirály race — only once the tournament is decided.
-// Config override first (failsafe), else openfootball goal-list tally.
-function worldTopScorers() {
+// Winner(s) of the gólkirály race - only once the tournament is decided.
+function topScorerWinners() {
   if (CONFIG.TOP_SCORERS.length) return CONFIG.TOP_SCORERS;
-  if (!worldChampion()) return null; // race open until the final is played
+  if (!champion()) return null;
   const tally = topScorers(state.matches);
   if (!tally) return null;
   return tally.filter(s => s.goals === tally[0].goals).map(s => s.name);
@@ -163,43 +163,25 @@ function worldTopScorers() {
 /* ---------- scoring ---------- */
 
 function leaderboard() {
-  const guessPlayers = Object.keys(state.guesses).map(k => k.slice(k.indexOf(':') + 1));
-  const players = [...new Set([
-    ...playersFrom(state.votes), ...Object.keys(state.specials), ...guessPlayers,
-  ])].sort((a, b) => a.localeCompare(b));
-  const rows = players.map(p => ({ player: p, pts: 0, hit: 0, played: 0, exact: 0 }));
-  const byName = new Map(rows.map(r => [r.player, r]));
-  const champ = worldChampion();
-  if (champ) {
-    for (const p of players) {
-      if (state.specials[p]?.champion === champ) byName.get(p).pts += CONFIG.POINTS_CHAMPION;
-    }
-  }
-  const tops = worldTopScorers()?.map(norm);
-  if (tops?.length) {
-    for (const p of players) {
-      if (tops.includes(norm(state.specials[p]?.top_scorer))) {
-        byName.get(p).pts += CONFIG.POINTS_TOP_SCORER;
-      }
-    }
+  const players = Object.entries(state.profiles).map(([id, name]) => ({ id, name }));
+  const rows = players.map(p => ({ id: p.id, player: p.name, pts: 0, hit: 0, played: 0 }));
+  const byId = new Map(rows.map(r => [r.id, r]));
+  const champ = champion();
+  const tops = topScorerWinners()?.map(norm);
+  for (const r of rows) {
+    const t = state.trophy[r.id];
+    if (champ && t?.champion === champ) r.pts += CONFIG.POINTS_CHAMPION;
+    if (tops?.length && tops.includes(norm(t?.top_scorer))) r.pts += CONFIG.POINTS_TOP_SCORER;
   }
   for (const m of state.matches) {
+    if (!revealed(m) || !inBallot(m)) continue;
     const res = outcome(m);
     if (!res || m._live) continue;
-    for (const p of players) {
-      const row = byName.get(p);
-      const pick = state.votes[`${m.num}:${p}`];
-      if (pick) {
-        row.played++;
-        if (pick === res) {
-          row.hit++;
-          row.pts += isKnockout(m) ? CONFIG.POINTS_KO : CONFIG.POINTS_GROUP;
-        }
-      }
-      if (exactHit(m, state.guesses[`${m.num}:${p}`])) {
-        row.exact++;
-        row.pts += CONFIG.POINTS_EXACT;
-      }
+    for (const r of rows) {
+      const pick = state.picks[`${m.num}:${r.id}`];
+      if (!pick) continue;
+      r.played++;
+      if (pick === res) { r.hit++; r.pts += CONFIG.POINTS_MATCH; }
     }
   }
   return rows.sort((a, b) => b.pts - a.pts || b.hit - a.hit || a.player.localeCompare(b.player));
@@ -207,16 +189,24 @@ function leaderboard() {
 
 /* ---------- rendering ---------- */
 
+// Sticky ballot bar + scroll padding follow the real header height.
+function syncHeader() {
+  const hdr = document.querySelector('header');
+  if (hdr) document.documentElement.style.setProperty('--hdr', `${hdr.offsetHeight}px`);
+}
+
 function render() {
-  // Don't clobber an input the user is typing in (refresh tick re-renders).
+  renderAuth(); // cheap no-op unless the modal state changed
   const ae = document.activeElement;
   if (ae && ae.tagName === 'INPUT' && $('#view')?.contains(ae)) return;
   state.now = new Date();
-  $('#player-chip').textContent = playerName() || 'SET NAME';
+  const u = me();
+  $('#player-chip').textContent = u ? u.username : 'LOG IN';
   $('#mode-banner').hidden = online();
+  syncHeader();
   const view = {
     matches: renderMatches,
-    groups: renderGroups,
+    table: renderTable,
     knockout: renderKnockout,
     trophy: renderTrophy,
     board: renderBoard,
@@ -224,31 +214,21 @@ function render() {
   $('#view').innerHTML = view();
   document.querySelectorAll('.tab').forEach(t =>
     t.classList.toggle('active', t.dataset.view === state.view));
-  // Jump to the focus match — but only once scores/picks have loaded, so the
-  // finished cards above it have their final height and don't shove it away.
   if (state.view === 'matches' && !state.autoScrolled && state.scoresLoaded) {
     const num = focusMatchNum();
-    const target = (num != null && document.getElementById(`m${num}`))
-      || document.querySelector('.day-today');
+    const target = (num != null && document.getElementById(`m${num}`)) || document.querySelector('.day-today');
     if (target) {
-      target.scrollIntoView({ block: 'start' }); // scroll-padding-top clears the sticky header
-      state.autoScrolled = true; // latch until the user leaves & re-enters Matches
+      target.scrollIntoView({ block: 'start' });
+      state.autoScrolled = true;
     }
   }
 }
 
-// The match the app should jump to:
-//   1. a game in play — but only one whose kickoff is within the live window,
-//      so a stale _live flag left on an old match can't drag the jump back
-//   2. else the next match that hasn't kicked off (rolls to the next day)
-//   3. else the last match (tournament over)
-const LIVE_WINDOW_MS = 150 * 60_000; // 90' + ET + pens + halftime headroom
+// Jump target: a live match, else the next kickoff, else the last match.
+const LIVE_WINDOW_MS = 150 * 60_000;
 function focusMatchNum() {
-  const sorted = [...state.matches].sort((a, b) => kickoff(a) - kickoff(b));
+  const sorted = [...state.matches].filter(m => m.phase === 'league').sort((a, b) => kickoff(a) - kickoff(b));
   const now = state.now.getTime();
-  // status()==='live' covers both the live feed and the post-kickoff window;
-  // the time guard discards a stale flag stuck on a long-finished match.
-  // (A live match carries a *current* score.ft, so don't test ft here.)
   const live = sorted.find(m => {
     const k = kickoff(m).getTime();
     return now >= k && now < k + LIVE_WINDOW_MS && status(m, state.now) === 'live';
@@ -259,257 +239,205 @@ function focusMatchNum() {
   return sorted.length ? sorted[sorted.length - 1].num : null;
 }
 
+// Status strip for a phase's ballot (top of Matches / each knockout round).
+function ballotBar(phase) {
+  const b = ballot(phase);
+  const st = ballotState(phase);
+  const label = (b?.label ?? PHASE_LABEL[phase] ?? phase).toUpperCase();
+  if (st === 'none') {
+    return phase === 'league'
+      ? `<div class="ballot-bar none">🗳 ${label} BALLOT — not open yet</div>`
+      : '';
+  }
+  const lock = fmtDeadline(new Date(b.locks_at));
+  if (st === 'upcoming') return `<div class="ballot-bar none">🗳 ${label} BALLOT opens ${fmtDeadline(new Date(b.opens_at))} · locks ${lock}</div>`;
+  if (st === 'locked') return `<div class="ballot-bar locked">🔒 ${label} BALLOT LOCKED — everyone's picks revealed</div>`;
+  const { picked, total } = pickedCount(phase);
+  if (st === 'submitted') return `<div class="ballot-bar done">✅ ${label} BALLOT SUBMITTED · ${picked}/${total} picks · locks ${lock}</div>`;
+  const saving = state.pendingWrites > 0;
+  const complete = total > 0 && picked === total && !saving;
+  const hint = phase === 'league' ? 'Pick every match + champion + top scorer first' : 'Pick every match first';
+  return `<div class="ballot-bar open">
+    <div class="bb-text">🗳 ${label} BALLOT OPEN · <b>${picked}/${total}</b> picked · locks ${lock}</div>
+    <button class="submit-ballot" data-phase="${esc(phase)}" ${complete ? '' : 'disabled'}
+      title="${complete ? 'Submit — final, no changes after' : saving ? 'Saving picks…' : hint}">SUBMIT</button>
+  </div>`;
+}
+
 function matchCard(m) {
   const st = m._live ? 'live' : status(m, state.now);
   const g = goals(m);
-  const open = votingOpen(m, state.now);
-  const mine = myPick(m);
   const res = outcome(m);
-  const ko = isKnockout(m);
-  const picks = votesFor(m);
-  const locked = !open;
-  // Hit/miss coloring only once the match is decided — a live running score
-  // would paint picks wrong (KO at 1:1 makes outcome 'X', nobody's pick), and
-  // a KO tie at FT stays undecided until pens reach the feed.
-  const decided = st === 'finished' && !!res && !(ko && res === 'X');
+  const mine = myPick(m);
+  const opts = options(m);
+  const editable = canPick(m);
+  const shown = inBallot(m);
+  const open = revealed(m);
+  const picks = open ? picksFor(m) : { 1: [], X: [], 2: [] };
+  const decided = st === 'finished' && !!res && !m._live;
 
-  const opts = ko ? ['1', '2'] : ['1', 'X', '2'];
-  const voteBtns = opts.map(o => {
-    const names = picks[o];
-    const isMine = mine === o;
-    const cls = [
-      'vote-btn',
-      isMine ? 'mine' : '',
-      decided ? (o === res ? 'hit' : isMine ? 'miss' : '') : '',
-    ].join(' ');
-    const label = o === '1' ? (ko ? teamShort(m.team1) : '1')
-                : o === '2' ? (ko ? teamShort(m.team2) : '2') : 'X';
-    // Counts stay hidden until kickoff — fully blind voting.
-    const count = locked && names.length ? `<span class="vcount">${names.length}</span>` : '';
-    return `<button class="${cls}" data-vote="${o}" data-num="${m.num}"
-      ${locked || placeholder(m) ? 'disabled' : ''}>${label}${count}</button>`;
-  }).join('');
+  const optLabel = o => o === 'X' ? 'X' : isWinnerOnly(m) ? teamShort(o === '1' ? m.team1 : m.team2) : o;
 
-  // Friends' picks revealed once voting locks.
-  const reveal = locked && Object.values(picks).some(a => a.length)
-    ? `<div class="picks-line">${opts.filter(o => picks[o].length)
-        .map(o => `<span class="pick-tag">${o === 'X' ? 'X' : o === '1' ? teamShort(m.team1) : teamShort(m.team2)}: ${picks[o].map(esc).join(', ')}</span>`)
-        .join(' ')}</div>`
-    : '';
-
-  // Exact score: inputs while open, revealed guesses (✓ = +5) once locked.
-  const mg = myGuess(m);
-  const guessRow = !locked
-    ? `<div class="guess-row" data-num="${m.num}">
-        <span class="guess-lab">EXACT</span>
-        <input class="gh" type="number" min="0" max="30" inputmode="numeric" placeholder="–" value="${mg ? mg[0] : ''}">
-        <span class="gsep">:</span>
-        <input class="ga" type="number" min="0" max="30" inputmode="numeric" placeholder="–" value="${mg ? mg[1] : ''}">
-        <button class="guess-save">OK</button>
-      </div>`
-    : '';
-  const gl = guessesFor(m);
-  // ✓ only after FT — a live running score would flash exact hits mid-match.
-  const xh = g => st === 'finished' && exactHit(m, g);
-  const guessReveal = locked && gl.length
-    ? `<div class="picks-line">${gl.map(({ player, g }) =>
-        `<span class="pick-tag ${xh(g) ? 'ghit' : ''}">${esc(player)} ${g[0]}:${g[1]}${xh(g) ? ' ✓' : ''}</span>`).join('')}</div>`
-    : '';
+  let voteArea = '';
+  if (shown && (editable || mine || open)) {
+    const btns = opts.map(o => {
+      const isMine = mine === o;
+      const cls = ['vote-btn', isMine ? 'mine' : '',
+        decided && open ? (o === res ? 'hit' : isMine ? 'miss' : '') : ''].join(' ');
+      const count = open && picks[o].length ? `<span class="vcount">${picks[o].length}</span>` : '';
+      return `<button class="${cls}" data-vote="${o}" data-num="${m.num}" ${editable ? '' : 'disabled'}><span class="vlabel">${esc(optLabel(o))}</span>${count}</button>`;
+    }).join('');
+    const reveal = open && Object.values(picks).some(a => a.length)
+      ? `<div class="picks-line">${opts.filter(o => picks[o].length)
+          .map(o => `<span class="pick-tag ${decided && o === res ? 'ghit' : ''}">${esc(optLabel(o))}: ${picks[o].map(esc).join(', ')}</span>`)
+          .join(' ')}</div>`
+      : '';
+    voteArea = `<div class="vote-row">${btns}</div>${reveal}`;
+  } else if (shown && ballotState(m.phase) === 'upcoming') {
+    voteArea = `<div class="vote-locked">⏳ BALLOT OPENS ${fmtDeadline(new Date(ballot(m.phase).opens_at)).toUpperCase()}</div>`;
+  } else if (!shown && ballot(m.phase)) {
+    voteArea = `<div class="vote-locked dim">NOT IN BALLOT — played before launch</div>`;
+  }
 
   const score = g
-    ? `<div class="score">${g.home}<span class="sep">:</span>${g.away}${g.pens ? `<span class="pens">(${g.pens[0]}–${g.pens[1]} p)</span>` : ''}</div>`
+    ? `<div class="score">${g.home}<span class="sep">:</span>${g.away}${g.et ? '<span class="pens">AET</span>' : ''}${g.pens ? `<span class="pens">(${g.pens[0]}–${g.pens[1]} p)</span>` : ''}</div>`
     : `<div class="score ko-time">${fmtTime(m)}</div>`;
-
   const badge = st === 'live' || m._live
     ? '<span class="badge live">● LIVE</span>'
     : st === 'finished' && g ? '<span class="badge ft">FT</span>'
     : `<span class="badge num">M${m.num}</span>`;
-
-  // Voting not unlocked yet — show when it opens instead of buttons.
-  const unlock = unlockTime(m);
-  const future = state.now < unlock;
-  const unlockLabel = unlock.toDateString() === state.now.toDateString()
-    ? `TODAY ${unlock.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`
-    : unlock.toLocaleDateString([], { month: 'short', day: 'numeric' }).toUpperCase();
-  const voteArea = future
-    ? `<div class="vote-locked">⏳ VOTING OPENS ${unlockLabel}</div>`
-    : `<div class="vote-row">${voteBtns}</div>${guessRow}${reveal}${guessReveal}`;
+  const meta = [m.round + (m.leg ? ` · leg ${m.leg}` : ''), fmtDay(kickoff(m)), m.ground].filter(Boolean).join(' · ');
 
   return `
-  <article class="match ${st}" id="m${m.num}">
-    <div class="match-meta">
-      ${badge}
-      <span class="meta-text">${m.group ? m.group.replace('Group ', 'GRP ') : esc(m.round)} · ${esc(m.ground)}</span>
-    </div>
+  <article class="match ${st} ${mine ? 'picked' : ''}" id="m${m.num}">
+    <div class="match-meta">${badge}<span class="meta-text">${esc(meta)}</span></div>
     <div class="match-row">
-      <div class="team home"><span class="flag">${flag(m.team1)}</span><span class="tname">${esc(teamLabel(m.team1))}</span></div>
+      <div class="team home">${crest(m.team1)}<span class="tname">${esc(teamLabel(m.team1))}</span></div>
       ${score}
-      <div class="team away"><span class="tname">${esc(teamLabel(m.team2))}</span><span class="flag">${flag(m.team2)}</span></div>
+      <div class="team away"><span class="tname">${esc(teamLabel(m.team2))}</span>${crest(m.team2)}</div>
     </div>
     ${voteArea}
   </article>`;
 }
 
-function teamShort(name) {
-  if (placeholderName(name)) return slotLabel(name);
-  const map = { 'Bosnia & Herzegovina': 'Bosnia', 'Czech Republic': 'Czechia', 'South Africa': 'S. Africa', 'South Korea': 'S. Korea', 'Saudi Arabia': 'Saudi A.', 'New Zealand': 'N. Zealand', 'Ivory Coast': 'Ivory C.' };
-  return map[name] ?? name;
-}
-
-// Cross-check an exact-score guess against the 1X2 pick. Returns an error
-// message on contradiction, null when consistent (or no pick yet).
-// Knockout: a draw guess fits any pick — pens decide the winner.
-function guessConflict(match, pick, h, a) {
-  if (!match || !pick) return null;
-  const dir = h > a ? '1' : h < a ? '2' : 'X';
-  if (dir === pick) return null;
-  if (isKnockout(match) && dir === 'X') return null;
-  const label = {
-    1: `${teamShort(match.team1)} win`,
-    2: `${teamShort(match.team2)} win`,
-    X: 'draw',
-  };
-  return `${h}:${a} = ${label[dir]}, but your pick is ${label[pick]}`;
-}
-
 function renderMatches() {
+  const league = state.matches.filter(m => m.phase === 'league').sort((a, b) => kickoff(a) - kickoff(b));
   const days = new Map();
-  const sorted = [...state.matches].sort((a, b) => kickoff(a) - kickoff(b));
-  for (const m of sorted) {
-    const key = kickoff(m).toDateString();
+  for (const m of league) {
+    const key = `${m.round}|${kickoff(m).toDateString()}`;
     if (!days.has(key)) days.set(key, []);
     days.get(key).push(m);
   }
   const todayKey = state.now.toDateString();
-  let html = '';
+  let html = ballotBar('league');
+  let lastRound = '';
   for (const [key, ms] of days) {
-    const d = new Date(key);
-    const isToday = key === todayKey;
+    const [round, dayStr] = key.split('|');
+    const d = new Date(dayStr);
+    const isToday = dayStr === todayKey;
+    if (round !== lastRound) {
+      html += `<h2 class="md-head">${esc(round.toUpperCase())}</h2>`;
+      lastRound = round;
+    }
     html += `<section class="day ${isToday ? 'day-today' : ''}">
-      <h2 class="day-head">${isToday ? '<span class="today-tag">TODAY</span>' : ''}${fmtDay(d)}</h2>
+      <h3 class="day-head">${isToday ? '<span class="today-tag">TODAY</span>' : ''}${fmtDay(d)}</h3>
       ${ms.map(matchCard).join('')}
     </section>`;
   }
   return html;
 }
 
-function renderGroups() {
-  return `<div class="groups-grid">` + GROUPS.map(gr => {
-    const rows = standings(state.matches, gr);
-    return `<section class="group-card">
-      <h2 class="group-head">${gr.toUpperCase()}</h2>
-      <table class="gtable">
-        <thead><tr><th></th><th class="tl">TEAM</th><th>P</th><th>GD</th><th>PTS</th></tr></thead>
-        <tbody>${rows.map((r, i) => `
-          <tr class="${i < 2 ? 'qual' : i === 2 ? 'maybe' : ''}">
-            <td>${i + 1}</td>
-            <td class="tl">${flag(r.team)} ${esc(teamShort(r.team))}</td>
-            <td>${r.p}</td><td>${r.gf - r.ga > 0 ? '+' : ''}${r.gf - r.ga}</td>
-            <td class="pts">${r.pts}</td>
-          </tr>`).join('')}
-        </tbody>
-      </table>
-    </section>`;
-  }).join('') + `</div>`;
+function renderTable() {
+  const rows = state.table ?? standings(state.matches, 'League Phase');
+  const zone = r => r.rank <= 8 ? 'qual' : r.rank <= 24 ? 'maybe' : 'out';
+  return `<section class="group-card table-card">
+    <h2 class="group-head">LEAGUE PHASE</h2>
+    <table class="gtable">
+      <thead><tr><th>#</th><th class="tl">TEAM</th><th>P</th><th>W</th><th>D</th><th>L</th><th>GD</th><th>PTS</th></tr></thead>
+      <tbody>${rows.map(r => `
+        <tr class="${zone(r)}" title="${esc(r.note ?? '')}">
+          <td>${r.rank}</td>
+          <td class="tl">${crest(r.team, 'crest sm')} ${esc(teamShort(r.team))}</td>
+          <td>${r.p}</td><td>${r.w}</td><td>${r.d}</td><td>${r.l}</td>
+          <td>${r.gf - r.ga > 0 ? '+' : ''}${r.gf - r.ga}</td>
+          <td class="pts">${r.pts}</td>
+        </tr>`).join('')}
+      </tbody>
+    </table>
+    <p class="special-note">1–8 straight to the round of 16 · 9–24 knockout play-off · 25–36 out${state.table ? ' · official ESPN table' : ' · computed from results'}</p>
+  </section>`;
 }
 
 function renderKnockout() {
-  return KO_ROUNDS.map(round => {
-    const ms = state.matches.filter(m => m.round === round)
-      .sort((a, b) => kickoff(a) - kickoff(b));
+  const sections = KO_ROUNDS.map(round => {
+    const ms = state.matches.filter(m => m.round === round).sort((a, b) => kickoff(a) - kickoff(b));
     if (!ms.length) return '';
+    const phase = ms[0].phase;
     return `<section class="ko-round">
-      <h2 class="day-head">${esc(round.toUpperCase())}</h2>
+      <h2 class="md-head">${esc(round.toUpperCase())}</h2>
+      ${ballotBar(phase)}
       ${ms.map(matchCard).join('')}
     </section>`;
   }).join('');
+  if (sections) return sections;
+  return `<div class="empty">Knockout fixtures appear after the league phase (draw late January).<br>
+    A new ballot opens for every round.</div>`;
 }
 
 function renderTrophy() {
-  const deadline = specialsDeadline();
-  const fin = finalMatch();
-  const champLocked = state.now >= deadline;
-  const scoreLocked = fin ? state.now >= kickoff(fin) : false;
-  const champ = worldChampion();
-  const mine = mySpecial();
-  const fmtDeadline = d => d.toLocaleString([], {
-    month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit',
-  });
+  const st = ballotState('league');
+  const b = ballot('league');
+  const editable = st === 'open';
+  const locked = st === 'locked';
+  const champ = champion();
+  const mine = myTrophy();
+  const lockTxt = b ? (locked ? 'LOCKED' : `locks ${fmtDeadline(new Date(b.locks_at))}`) : 'ballot not open yet';
 
-  // --- champion section ---
+  // --- champion ---
   let champBody;
-  if (!champLocked && mine.champion) {
-    // One-shot pick already made — show it, no way back.
-    champBody = `
-      <div class="special-row champ-final">
-        <span class="sp-player">YOUR PICK</span>
-        <span class="sp-pick">${flag(mine.champion)} ${esc(mine.champion)} 🔒</span>
-      </div>
-      <p class="special-note">Pick is final — it can't be changed. Hidden from others
-      until the picks lock.</p>`;
-  } else if (!champLocked) {
-    const sel = state.champPick;
-    champBody = `<div class="champ-grid">${Object.keys(TEAMS).map(t => `
-      <button class="champ-btn ${sel === t ? 'mine' : ''}" data-champ="${esc(t)}">
-        <span class="flag">${flag(t)}</span><span>${esc(teamShort(t))}</span>
+  if (!locked) {
+    champBody = `<div class="champ-grid">${Object.keys(TEAMS).sort().map(t => `
+      <button class="champ-btn ${mine.champion === t ? 'mine' : ''}" data-champ="${esc(t)}" ${editable ? '' : 'disabled'}>
+        ${crest(t, 'crest sm')}<span>${esc(teamShort(t))}</span>
       </button>`).join('')}</div>
-      ${sel ? `
-      <div class="champ-confirm">
-        <span class="confirm-txt">${flag(sel)} ${esc(sel)} — final answer? No changes later.</span>
-        <button id="champ-ok">OK</button>
-      </div>` : ''}
-      <p class="special-note">One shot — once you press OK the pick is locked forever.
-      Hidden from others until the picks lock.</p>`;
+      <p class="special-note">${editable ? 'Tap to pick — changeable until you SUBMIT the league ballot.' : st === 'submitted' ? 'Submitted — final.' : 'Not editable now.'}
+      Hidden from others until the ballot locks.</p>`;
   } else {
-    const rows = Object.entries(state.specials)
-      .filter(([, s]) => s.champion)
-      .sort(([a], [b]) => a.localeCompare(b));
+    const rows = Object.entries(state.trophy).filter(([, s]) => s.champion)
+      .map(([id, s]) => [state.profiles[id] ?? '?', s]).sort(([a], [b]) => a.localeCompare(b));
     champBody = rows.length
       ? `<div class="special-list">${rows.map(([p, s]) => `
           <div class="special-row ${champ && s.champion === champ ? 'won' : ''}">
             <span class="sp-player">${esc(p)}</span>
-            <span class="sp-pick">${flag(s.champion)} ${esc(s.champion)}${champ && s.champion === champ ? ' ✓' : ''}</span>
+            <span class="sp-pick">${crest(s.champion, 'crest sm')} ${esc(s.champion)}${champ && s.champion === champ ? ' ✓' : ''}</span>
           </div>`).join('')}</div>`
-      : `<div class="empty">Nobody dared to pick a champion.</div>`;
+      : `<div class="empty">Nobody picked a champion.</div>`;
   }
 
-  // --- gólkirály (top scorer) section — same lifecycle as champion ---
-  const winners = worldTopScorers();
+  // --- top scorer ---
+  const winners = topScorerWinners();
   const winnersN = winners?.map(norm) ?? [];
   let scorerBody;
-  if (!champLocked && mine.top_scorer) {
-    scorerBody = `
-      <div class="special-row champ-final">
-        <span class="sp-player">YOUR PICK</span>
-        <span class="sp-pick">⚽ ${esc(mine.top_scorer)} 🔒</span>
-      </div>
-      <p class="special-note">Pick is final — it can't be changed. Hidden from others
-      until the picks lock.</p>`;
-  } else if (!champLocked) {
-    const sel = state.scorerPick;
+  if (!locked) {
+    const sel = mine.top_scorer;
+    const inList = SCORERS.some(([n]) => n === sel);
     scorerBody = `<div class="champ-grid">${SCORERS.map(([n, t]) => `
-      <button class="champ-btn scorer-btn ${sel === n ? 'mine' : ''}" data-scorer="${esc(n)}">
-        <span class="flag">${flag(t)}</span><span>${esc(n)}</span>
+      <button class="champ-btn scorer-btn ${sel === n ? 'mine' : ''}" data-scorer="${esc(n)}" ${editable ? '' : 'disabled'}>
+        ${crest(t, 'crest sm')}<span>${esc(n)}</span>
       </button>`).join('')}
-      <button class="champ-btn scorer-other ${state.scorerCustom ? 'mine' : ''}" id="scorer-other">
-        <span class="flag">✏️</span><span>OTHER…</span>
+      <button class="champ-btn scorer-other ${sel && !inList ? 'mine' : ''}" id="scorer-other" ${editable ? '' : 'disabled'}>
+        <span class="crest sm ph">✏️</span><span>${sel && !inList ? esc(sel) : 'OTHER…'}</span>
       </button></div>
-      ${state.scorerCustom ? `
+      ${state.scorerCustom && editable ? `
       <div class="fs-row scorer-custom">
-        <input id="scorer-input" maxlength="40" placeholder="Player name…" autocomplete="off">
+        <input id="scorer-input" maxlength="40" placeholder="Player name…" autocomplete="off" value="${sel && !inList ? esc(sel) : ''}">
         <button id="scorer-set">SET</button>
       </div>` : ''}
-      ${sel ? `
-      <div class="champ-confirm">
-        <span class="confirm-txt">⚽ ${esc(sel)} — final answer? No changes later.</span>
-        <button id="scorer-ok">OK</button>
-      </div>` : ''}
-      <p class="special-note">One shot — once you press OK the pick is locked forever.
-      Hidden from others until the picks lock.</p>`;
+      <p class="special-note">${editable ? 'Tap to pick — changeable until you SUBMIT the league ballot.' : st === 'submitted' ? 'Submitted — final.' : 'Not editable now.'}
+      Hidden from others until the ballot locks.</p>`;
   } else {
-    const rows = Object.entries(state.specials)
-      .filter(([, s]) => s.top_scorer)
-      .sort(([a], [b]) => a.localeCompare(b));
+    const rows = Object.entries(state.trophy).filter(([, s]) => s.top_scorer)
+      .map(([id, s]) => [state.profiles[id] ?? '?', s]).sort(([a], [b]) => a.localeCompare(b));
     scorerBody = rows.length
       ? `<div class="special-list">${rows.map(([p, s]) => `
           <div class="special-row ${winnersN.includes(norm(s.top_scorer)) ? 'won' : ''}">
@@ -519,57 +447,23 @@ function renderTrophy() {
       : `<div class="empty">Nobody picked a gólkirály.</div>`;
   }
 
-  // --- exact final score section ---
-  let scoreBody;
-  if (!scoreLocked) {
-    scoreBody = `
-      <div class="fs-row">
-        <input id="fs-input" maxlength="40" placeholder="e.g. Argentina 2:1 France"
-          value="${esc(mine.final_score ?? '')}" autocomplete="off">
-        <button id="fs-save">SAVE</button>
-      </div>
-      <p class="special-note">Free text — write the exact final result you expect.
-      Hidden from others until the final kicks off. Bragging rights only.</p>`;
-  } else {
-    const rows = Object.entries(state.specials)
-      .filter(([, s]) => s.final_score)
-      .sort(([a], [b]) => a.localeCompare(b));
-    scoreBody = rows.length
-      ? `<div class="special-list">${rows.map(([p, s]) => `
-          <div class="special-row">
-            <span class="sp-player">${esc(p)}</span>
-            <span class="sp-pick">${esc(s.final_score)}</span>
-          </div>`).join('')}</div>`
-      : `<div class="empty">No final score predictions.</div>`;
-  }
-
-  const scoreSection = CONFIG.SHOW_FINAL_SCORE ? `
-  <section class="special-card">
-    <h2 class="group-head">✍️ EXACT FINAL SCORE</h2>
-    <p class="special-note">${scoreLocked ? 'LOCKED' : `locks ${fin ? fmtDeadline(kickoff(fin)) : '—'} (final kickoff)`}</p>
-    ${scoreBody}
-  </section>` : '';
-
   return `
   <section class="special-card">
-    <h2 class="group-head">🏆 WORLD CUP CHAMPION</h2>
-    <p class="special-note">${CONFIG.POINTS_CHAMPION} pts for the correct winner ·
-      ${champLocked ? 'LOCKED' : `locks ${fmtDeadline(deadline)} (NED–JPN kickoff)`}</p>
+    <h2 class="group-head">🏆 CHAMPIONS LEAGUE WINNER</h2>
+    <p class="special-note">${CONFIG.POINTS_CHAMPION} pts for the correct winner · ${lockTxt}</p>
     ${champBody}
   </section>
   <section class="special-card">
     <h2 class="group-head">👑 GÓLKIRÁLY — TOP SCORER</h2>
-    <p class="special-note">${CONFIG.POINTS_TOP_SCORER} pts for the tournament's top scorer ·
-      ${champLocked ? 'LOCKED' : `locks ${fmtDeadline(deadline)} (NED–JPN kickoff)`}</p>
+    <p class="special-note">${CONFIG.POINTS_TOP_SCORER} pts for the season's top scorer · ${lockTxt}</p>
     ${scorerBody}
   </section>
-  ${scorerRaceCard()}${scoreSection}`;
+  ${scorerRaceCard()}`;
 }
 
-// Live top-5 scorer board (display only) — counts from ESPN, see fetchTopScorers.
 function scorerRaceCard() {
-  const race = state.scorerRace ?? [];
-  const top = race.slice(0, 5);
+  const race = topScorers(state.matches) ?? [];
+  const top = race.slice(0, 8);
   const lead = top.length ? top[0].goals : 0;
   const body = top.length
     ? `<div class="scorer-race">${top.map((s, i) => `
@@ -588,96 +482,162 @@ function scorerRaceCard() {
 }
 
 function scoringLegend() {
-  const resPts = CONFIG.POINTS_GROUP === CONFIG.POINTS_KO
-    ? `${CONFIG.POINTS_GROUP}` : `${CONFIG.POINTS_GROUP}/${CONFIG.POINTS_KO}`;
   return `
   <section class="special-card rules-card">
     <h2 class="group-head">📐 SCORING</h2>
     <div class="rule-row"><span class="rule-ico">✓</span>
-      <span class="rule-lab">Correct result — 1 / X / 2</span>
-      <span class="rule-pts">${resPts} pts</span></div>
-    <div class="rule-row"><span class="rule-ico">🎯</span>
-      <span class="rule-lab">Exact score — EXACT row on the match</span>
-      <span class="rule-pts">+${CONFIG.POINTS_EXACT} pts</span></div>
-    <div class="rule-row rule-sub"><span class="rule-ico">↳</span>
-      <span class="rule-lab">both right on one match</span>
-      <span class="rule-pts">${CONFIG.POINTS_GROUP + CONFIG.POINTS_EXACT} pts</span></div>
+      <span class="rule-lab">Correct result — 1 / X / 2 (final: winner)</span>
+      <span class="rule-pts">${CONFIG.POINTS_MATCH} pts</span></div>
     <div class="rule-row"><span class="rule-ico">🏆</span>
-      <span class="rule-lab">World Cup champion — Trophy tab</span>
+      <span class="rule-lab">Champions League winner — Trophy tab</span>
       <span class="rule-pts">${CONFIG.POINTS_CHAMPION} pts</span></div>
     <div class="rule-row"><span class="rule-ico">👑</span>
       <span class="rule-lab">Gólkirály (top scorer) — Trophy tab</span>
       <span class="rule-pts">${CONFIG.POINTS_TOP_SCORER} pts</span></div>
-    <p class="special-note">Votes lock at kickoff · everyone's picks hidden until then.</p>
+    <p class="special-note">One ballot per phase: pick every match, press SUBMIT. Unsubmitted ballots lock
+      automatically at the deadline. Everyone's picks stay hidden until then.</p>
   </section>`;
 }
 
 function renderBoard() {
   const rows = leaderboard();
-  if (!rows.length) {
-    return scoringLegend() +
-      `<div class="empty">No players yet. Vote on a match to enter the arena.</div>`;
-  }
+  if (!rows.length) return scoringLegend() + `<div class="empty">No players yet.</div>`;
   const medals = ['🥇', '🥈', '🥉'];
+  const anyRevealed = Object.keys(state.ballots).some(p => ballotState(p) === 'locked');
+  const id = myId();
+  if (!anyRevealed) {
+    // Nothing to score yet: show who is in and who has submitted.
+    const subs = Object.keys(state.submissions);
+    return scoringLegend() + `<table class="board">
+      <thead><tr><th class="tl">PLAYER</th><th>LEAGUE BALLOT</th></tr></thead>
+      <tbody>${rows.sort((a, b) => a.player.localeCompare(b.player)).map(r => `
+        <tr class="${r.id === id ? 'me' : ''}">
+          <td class="tl">${esc(r.player)}</td>
+          <td>${subs.includes(`league:${r.id}`) ? '<span class="ok">SUBMITTED ✓</span>' : '<span class="dim">draft</span>'}</td>
+        </tr>`).join('')}
+      </tbody></table>`;
+  }
   return scoringLegend() + `<table class="board">
-    <thead><tr><th>#</th><th class="tl">PLAYER</th><th>HITS</th><th>EXACT</th><th>PTS</th></tr></thead>
+    <thead><tr><th>#</th><th class="tl">PLAYER</th><th>HITS</th><th>PTS</th></tr></thead>
     <tbody>${rows.map((r, i) => `
-      <tr class="${r.player === playerName() ? 'me' : ''}">
+      <tr class="${r.id === id ? 'me' : ''}">
         <td>${medals[i] ?? i + 1}</td>
         <td class="tl">${esc(r.player)}</td>
         <td>${r.hit}/${r.played}</td>
-        <td>${r.exact ? '★' + r.exact : '–'}</td>
         <td class="pts">${r.pts}</td>
       </tr>`).join('')}
     </tbody>
   </table>`;
 }
 
-/* ---------- name modal ---------- */
+/* ---------- auth modal ---------- */
 
-function askName(force = false) {
-  // Devices from before the PIN era have a name but no claim — ask once.
-  if (playerName() && isClaimed() && !force) return;
-  $('#name-modal').hidden = false;
-  const input = $('#name-input');
-  input.value = playerName();
-  $('#pin-input').value = '';
-  $('#name-error').hidden = true;
-  setTimeout(() => (input.value ? $('#pin-input') : input).focus(), 50);
+function openAuth(mode) {
+  state.authMode = mode;
+  state.authError = '';
+  state.authErrorCode = '';
+  renderAuth();
+  setTimeout(() => $('#auth-modal input:not([type=hidden])')?.focus(), 50);
+}
+function closeAuth() {
+  state.authMode = null;
+  document.activeElement?.blur?.();
+  renderAuth();
 }
 
-async function saveName() {
-  const v = $('#name-input').value.trim();
-  const pin = $('#pin-input').value.trim();
-  const err = $('#name-error');
-  if (!v) return;
-  if (online() && !/^\d{4,8}$/.test(pin)) {
-    err.textContent = 'PIN must be 4–8 digits.';
-    err.hidden = false;
-    return;
+// Rebuilds the modal only when its state actually changed, and carries typed
+// values across rebuilds (busy / error toggles) so nothing the user typed is lost.
+function renderAuth() {
+  const modal = $('#auth-modal');
+  const mode = state.authMode;
+  modal.hidden = !mode;
+  if (!mode) { modal.dataset.sig = ''; modal.dataset.mode = ''; return; }
+  const sig = [mode, state.authBusy, state.authError, state.authInfo ?? ''].join('|');
+  if (modal.dataset.sig === sig) return;
+  const sameMode = modal.dataset.mode === mode;
+  modal.dataset.sig = sig;
+  modal.dataset.mode = mode;
+  const kept = {};
+  if (sameMode) for (const i of modal.querySelectorAll('input')) kept[i.id] = i.value;
+
+  const busy = state.authBusy ? 'disabled' : '';
+  const err = state.authError ? `<p class="auth-error">${esc(state.authError)}</p>` : '';
+  const field = (id, ph, type = 'text', extra = '', ac = 'off') =>
+    `<input id="${id}" type="${type}" placeholder="${ph}" autocomplete="${ac}" ${extra} ${busy}>`;
+  let body;
+  if (mode === 'local') {
+    body = `<h2>LOCAL MODE</h2>
+      <p class="modal-hint">No Supabase configured — picks stay on this device.</p>
+      ${field('a-name', 'Your name', 'text', 'maxlength="20"')}
+      ${err}<button id="a-local" ${busy}>ENTER</button>`;
+  } else if (mode === 'login') {
+    const resend = state.authErrorCode === 'email_not_confirmed'
+      ? ` · <a href="#" data-auth="resend">Resend confirmation</a>` : '';
+    body = `<h2>LOG IN</h2>
+      ${field('a-user', CONFIG.LOGIN_URL ? 'Username or email' : 'Email', 'text', '', 'username')}
+      ${field('a-pass', 'Password', 'password', '', 'current-password')}
+      ${err}<button id="a-login" ${busy}>ENTER ARENA</button>
+      <p class="modal-hint"><a href="#" data-auth="register">Create account</a> · <a href="#" data-auth="forgot">Forgot password</a>${resend}</p>`;
+  } else if (mode === 'register') {
+    body = `<h2>REGISTER</h2>
+      ${field('a-email', 'Email', 'email', '', 'email')}
+      ${field('a-name', 'Username (shown on the board)', 'text', 'maxlength="20"', 'username')}
+      ${field('a-pass', 'Password (min 6)', 'password', '', 'new-password')}
+      ${field('a-invite', 'Invite code', 'text')}
+      ${err}<button id="a-register" ${busy}>CREATE ACCOUNT</button>
+      <p class="modal-hint">You'll get a confirmation email. Click the link, then log in.<br>
+      <a href="#" data-auth="login">Back to log in</a></p>`;
+  } else if (mode === 'forgot') {
+    body = `<h2>RESET PASSWORD</h2>
+      ${field('a-email', 'Email', 'email', '', 'email')}
+      ${err}<button id="a-forgot" ${busy}>SEND RESET LINK</button>
+      <p class="modal-hint"><a href="#" data-auth="login">Back to log in</a></p>`;
+  } else if (mode === 'resend') {
+    body = `<h2>RESEND CONFIRMATION</h2>
+      ${field('a-email', 'Email you registered with', 'email', '', 'email')}
+      ${err}<button id="a-resend" ${busy}>SEND LINK AGAIN</button>
+      <p class="modal-hint"><a href="#" data-auth="login">Back to log in</a></p>`;
+  } else if (mode === 'reset') {
+    body = `<h2>NEW PASSWORD</h2>
+      ${field('a-pass', 'New password (min 6)', 'password', '', 'new-password')}
+      ${err}<button id="a-reset" ${busy}>SAVE PASSWORD</button>`;
+  } else if (mode === 'sent') {
+    body = `<h2>CHECK YOUR EMAIL</h2>
+      <p class="modal-hint">${esc(state.authInfo ?? 'We sent you a link.')}</p>
+      <button id="a-close" ${busy}>OK</button>`;
   }
-  const btn = $('#name-save');
-  btn.disabled = true;
+  modal.querySelector('.modal-box').innerHTML = body;
+  for (const i of modal.querySelectorAll('input')) if (kept[i.id] != null) i.value = kept[i.id];
+}
+
+// Runs an auth call with the modal in busy state. Field values are read by the
+// caller BEFORE this runs (the rebuild keeps them anyway, belt and braces).
+async function authAction(fn) {
+  state.authBusy = true; state.authError = ''; state.authErrorCode = ''; renderAuth();
   try {
-    const claimed = await claimPlayer(v, pin);
-    if (!claimed) {
-      // Registration is frozen, so null means either a wrong PIN on an existing
-      // name or a name that was never registered — be honest about both.
-      err.textContent = 'Wrong PIN, or this name isn’t in the game. New players are closed — ask Márk to add you.';
-      err.hidden = false;
-      return;
-    }
-    setPlayerName(claimed);
-    setClaimed();
-    $('#name-modal').hidden = true;
-    render();
+    await fn();
   } catch (e) {
     console.error(e);
-    err.textContent = 'Connection error — try again.';
-    err.hidden = false;
+    state.authError = describe(e);
+    state.authErrorCode = e?.code ?? '';
   } finally {
-    btn.disabled = false;
+    state.authBusy = false;
+    renderAuth();
+    setTimeout(() => $('#auth-modal input')?.focus(), 30);
   }
+}
+
+const val = id => $(`#${id}`)?.value ?? '';
+
+async function afterLogin() {
+  writeSeq++; // anything fetched for the previous identity is stale
+  closeAuth();
+  render();
+  const first = !state.stateLoaded;
+  await loadState();
+  // First full layout with ballot state: jump to the live / next match now.
+  if (first && state.stateLoaded) state.autoScrolled = false;
+  render();
 }
 
 /* ---------- events ---------- */
@@ -685,174 +645,210 @@ async function saveName() {
 document.addEventListener('click', async e => {
   const tab = e.target.closest('.tab');
   if (tab) {
-    // Re-arm the jump each time the user enters Matches from another tab.
     if (tab.dataset.view === 'matches' && state.view !== 'matches') state.autoScrolled = false;
+    const changed = state.view !== tab.dataset.view;
     state.view = tab.dataset.view;
     render();
+    if (changed && state.view !== 'matches') window.scrollTo(0, 0);
     return;
   }
 
-  if (e.target.closest('#player-chip')) { askName(true); return; }
-  if (e.target.closest('#name-save')) { saveName(); return; }
-
-  if (e.target.closest('.guess-save')) {
-    if (!playerName()) { askName(); return; }
-    const row = e.target.closest('.guess-row');
-    const num = Number(row.dataset.num);
-    const h = parseInt(row.querySelector('.gh').value, 10);
-    const a = parseInt(row.querySelector('.ga').value, 10);
-    if (!Number.isInteger(h) || !Number.isInteger(a) || h < 0 || a < 0 || h > 30 || a > 30) {
-      toast('Enter both scores (0–30)');
-      return;
+  if (e.target.closest('#player-chip')) {
+    if (!me()) { openAuth(online() ? 'login' : 'local'); return; }
+    if (confirm(`Log out ${me().username}?`)) {
+      writeSeq++;
+      await logout();
+      if (!online()) localStorage.removeItem('ucl.localName');
+      state.picks = {}; state.submissions = {}; state.trophy = {};
+      render();
+      openAuth(online() ? 'login' : 'local');
     }
-    const me = playerName();
-    const key = `${num}:${me}`;
-    const m = state.matches.find(x => x.num === num);
-    const conflict = guessConflict(m, state.votes[key], h, a);
-    if (conflict) { toast(conflict); return; }
-    const prev = state.guesses[key];
-    state.guesses[key] = [h, a]; // optimistic
+    return;
+  }
+
+  // auth modal
+  const sw = e.target.closest('[data-auth]');
+  if (sw) { e.preventDefault(); openAuth(sw.dataset.auth); return; }
+  if (e.target.closest('#a-close')) { closeAuth(); if (!me()) openAuth('login'); return; }
+  if (e.target.closest('#a-local')) {
+    const n = val('a-name').trim();
+    if (!n) return;
+    setLocalName(n);
+    await afterLogin();
+    return;
+  }
+  if (e.target.closest('#a-login')) {
+    const user = val('a-user'), pass = val('a-pass');
+    await authAction(async () => {
+      await login(user, pass);
+      await afterLogin();
+    });
+    return;
+  }
+  if (e.target.closest('#a-register')) {
+    const form = { email: val('a-email'), username: val('a-name'), password: val('a-pass'), invite: val('a-invite') };
+    await authAction(async () => {
+      const r = await signup(form);
+      if (r.needsConfirm) {
+        state.authInfo = `Confirmation link sent to ${form.email.trim()}. Open it, then log in.`;
+        state.authMode = 'sent';
+      } else {
+        await afterLogin();
+      }
+    });
+    return;
+  }
+  if (e.target.closest('#a-forgot')) {
+    const email = val('a-email');
+    await authAction(async () => {
+      await recover(email);
+      state.authInfo = 'If that email is registered, a reset link is on its way.';
+      state.authMode = 'sent';
+    });
+    return;
+  }
+  if (e.target.closest('#a-resend')) {
+    const email = val('a-email');
+    await authAction(async () => {
+      await resend(email);
+      state.authInfo = 'If that email is registered and unconfirmed, a new confirmation link is on its way.';
+      state.authMode = 'sent';
+    });
+    return;
+  }
+  if (e.target.closest('#a-reset')) {
+    const pass = val('a-pass');
+    await authAction(async () => {
+      await updatePassword(pass);
+      toast('Password saved ✓', 'ok');
+      await afterLogin();
+    });
+    return;
+  }
+
+  // ballot submit
+  const sub = e.target.closest('.submit-ballot');
+  if (sub && !sub.disabled) {
+    if (!me()) { openAuth(online() ? 'login' : 'local'); return; }
+    const phase = sub.dataset.phase;
+    const { picked, total } = pickedCount(phase);
+    if (picked !== total) { toast(phase === 'league' ? 'Pick every match, champion and top scorer first' : 'Pick every match first'); return; }
+    if (state.pendingWrites > 0) { toast('Still saving a pick — try again in a second'); return; }
+    if (!confirm(`Submit your ${ballot(phase)?.label ?? phase} ballot?\n\nFINAL — no changes afterwards.`)) return;
+    const key = `${phase}:${myId()}`;
+    writeSeq++;
+    state.pendingWrites++;
+    state.submissions[key] = new Date().toISOString(); // optimistic
+    render();
     try {
-      await castGuess(num, me, h, a);
-      toast(`Exact score saved: ${h}:${a} ✓`, 'ok');
+      await submitPhase(phase);
+      toast('Ballot submitted ✅', 'ok');
     } catch (err) {
       console.error(err);
-      if (prev) state.guesses[key] = prev; else delete state.guesses[key];
-      toast('Save failed — check connection');
+      delete state.submissions[key];
+      if (err instanceof AuthError && (err.code === 'session_expired' || err.code === 'no_session')) { render(); openAuth('login'); return; }
+      toast(err.locked ? 'Ballot is closed' : 'Submit failed — check connection');
+    } finally {
+      state.pendingWrites--;
+      writeSeq++; // snapshots that started during the write are stale
     }
+    await loadState().catch(() => {});
     render();
     return;
   }
 
+  // trophy picks
   if (e.target.closest('#scorer-other')) {
-    if (!playerName()) { askName(); return; }
-    if (mySpecial().top_scorer) return;
+    if (!me()) { openAuth(online() ? 'login' : 'local'); return; }
     state.scorerCustom = !state.scorerCustom;
-    state.scorerPick = null;
     render();
     return;
   }
-
   if (e.target.closest('#scorer-set')) {
     const v = $('#scorer-input').value.trim();
     if (!v) { toast('Type a player name'); return; }
-    state.scorerPick = v;
+    document.activeElement?.blur?.(); // let render() replace the input
     state.scorerCustom = false;
-    render();
+    await setTrophy({ top_scorer: v });
     return;
   }
-
   const scorerBtn = e.target.closest('.scorer-btn');
-  if (scorerBtn) {
-    if (!playerName()) { askName(); return; }
-    if (mySpecial().top_scorer) return; // one shot — already locked in
-    state.scorerPick = scorerBtn.dataset.scorer;
+  if (scorerBtn && !scorerBtn.disabled) {
     state.scorerCustom = false;
-    render();
+    await setTrophy({ top_scorer: scorerBtn.dataset.scorer });
+    return;
+  }
+  const champBtn = e.target.closest('.champ-btn[data-champ]');
+  if (champBtn && !champBtn.disabled) {
+    await setTrophy({ champion: champBtn.dataset.champ });
     return;
   }
 
-  if (e.target.closest('#scorer-ok')) {
-    if (!playerName()) { askName(); return; }
-    const me = playerName();
-    if (!state.scorerPick || state.specials[me]?.top_scorer) return;
-    const prev = state.specials[me] ?? { champion: null, final_score: null, top_scorer: null };
-    state.specials[me] = { ...prev, top_scorer: state.scorerPick }; // optimistic
-    state.scorerPick = null;
-    render();
-    try {
-      await saveSpecial(me, state.specials[me]);
-      toast('Gólkirály locked in 👑', 'ok');
-    } catch (err) {
-      console.error(err);
-      state.specials[me] = prev;
-      render();
-      toast('Save failed — check connection');
-    }
-    return;
-  }
-
-  const champBtn = e.target.closest('.champ-btn');
-  if (champBtn) {
-    if (!playerName()) { askName(); return; }
-    if (mySpecial().champion) return; // one shot — already locked in
-    state.champPick = champBtn.dataset.champ; // selection only, OK confirms
-    render();
-    return;
-  }
-
-  if (e.target.closest('#champ-ok')) {
-    if (!playerName()) { askName(); return; }
-    const me = playerName();
-    if (!state.champPick || (state.specials[me]?.champion)) return;
-    const prev = state.specials[me] ?? { champion: null, final_score: null };
-    state.specials[me] = { ...prev, champion: state.champPick }; // optimistic
-    state.champPick = null;
-    render();
-    try {
-      await saveSpecial(me, state.specials[me]);
-      toast('Champion locked in 🏆', 'ok');
-    } catch (err) {
-      console.error(err);
-      state.specials[me] = prev;
-      render();
-      toast('Save failed — check connection');
-    }
-    return;
-  }
-
-  if (e.target.closest('#fs-save')) {
-    if (!playerName()) { askName(); return; }
-    const me = playerName();
-    const text = $('#fs-input').value.trim();
-    const prev = state.specials[me] ?? { champion: null, final_score: null };
-    state.specials[me] = { ...prev, final_score: text || null };
-    try {
-      await saveSpecial(me, state.specials[me]);
-      toast('Final score saved ✓', 'ok');
-    } catch (err) {
-      console.error(err);
-      state.specials[me] = prev;
-      toast('Save failed — check connection');
-    }
-    render();
-    return;
-  }
-
+  // match pick
   const btn = e.target.closest('.vote-btn');
   if (btn && !btn.disabled) {
-    if (!playerName()) { askName(); return; }
+    if (!me()) { openAuth(online() ? 'login' : 'local'); return; }
     const num = Number(btn.dataset.num);
     const pick = btn.dataset.vote;
-    const key = `${num}:${playerName()}`;
-    const prev = state.votes[key];
-    const g = state.guesses[key];
-    if (g && guessConflict(state.matches.find(x => x.num === num), pick, g[0], g[1])) {
-      toast(`⚠ EXACT ${g[0]}:${g[1]} no longer matches your pick — update it`);
-    }
-    state.votes[key] = pick;          // optimistic
+    const key = `${num}:${myId()}`;
+    const prev = state.picks[key];
+    writeSeq++;
+    state.pendingWrites++;
+    state.picks[key] = pick; // optimistic
     render();
     try {
-      await castVote(num, playerName(), pick);
+      // One upsert at a time per match: a double-tap must end with the last tap.
+      const run = () => savePick(num, pick);
+      const p = (saving.get(key) ?? Promise.resolve()).then(run, run);
+      saving.set(key, p);
+      await p;
     } catch (err) {
       console.error(err);
-      if (prev) state.votes[key] = prev; else delete state.votes[key];
+      if (state.picks[key] === pick) { if (prev) state.picks[key] = prev; else delete state.picks[key]; }
+      if (err instanceof AuthError && (err.code === 'session_expired' || err.code === 'no_session')) { openAuth('login'); return; }
+      toast(err.locked ? 'Ballot is closed' : 'Pick failed — check connection');
+      if (err.locked) loadState().then(render).catch(() => {});
+    } finally {
+      state.pendingWrites--;
+      writeSeq++; // snapshots that started during the write are stale
       render();
-      toast('Vote failed — check connection');
     }
   }
 });
+const saving = new Map(); // "num:user" -> last save promise
+
+async function setTrophy(patch) {
+  if (!me()) { openAuth(online() ? 'login' : 'local'); return; }
+  const id = myId();
+  const prev = state.trophy[id] ?? { champion: null, top_scorer: null };
+  writeSeq++;
+  state.pendingWrites++;
+  state.trophy[id] = { ...prev, ...patch }; // optimistic
+  render();
+  try {
+    await saveTrophy(patch); // only the changed column goes to the server
+    toast(patch.champion ? 'Champion pick saved 🏆' : 'Gólkirály pick saved 👑', 'ok');
+  } catch (err) {
+    console.error(err);
+    state.trophy[id] = prev;
+    if (err instanceof AuthError && (err.code === 'session_expired' || err.code === 'no_session')) { openAuth('login'); return; }
+    toast(err.locked ? 'Ballot is closed' : 'Save failed — check connection');
+  } finally {
+    state.pendingWrites--;
+    writeSeq++; // snapshots that started during the write are stale
+    render();
+  }
+}
 
 document.addEventListener('keydown', e => {
-  if (e.key === 'Enter' && !$('#name-modal').hidden) { saveName(); return; }
-  if (e.key === 'Enter' && e.target.matches('#scorer-input')) {
-    $('#scorer-set').click();
+  if (e.key !== 'Enter') return;
+  if (e.target.matches('#auth-modal input')) {
+    e.preventDefault();
+    const btn = $('#auth-modal .modal-box > button');
+    if (btn && !btn.disabled) btn.click();
     return;
   }
-  if (e.key === 'Enter' && e.target.matches('.guess-row input')) {
-    e.target.closest('.guess-row').querySelector('.guess-save').click();
-    e.target.blur();
-  }
+  if (e.target.matches('#scorer-input')) { e.preventDefault(); $('#scorer-set').click(); }
 });
 
 function toast(msg, kind = 'err') {
@@ -864,33 +860,92 @@ function toast(msg, kind = 'err') {
   toast._timer = setTimeout(() => t.classList.remove('show'), 3000);
 }
 
+/* ---------- data loading ---------- */
+
+const loggedOut = e => e instanceof AuthError && (e.code === 'session_expired' || e.code === 'no_session');
+
+async function loadState() {
+  if (!me()) {
+    // Deadlines are public: show when the ballot opens even before login.
+    try { state.ballots = await fetchBallots(); } catch (e) { console.warn('ballots', e); }
+    return;
+  }
+  const seq = writeSeq, uid = myId();
+  try {
+    const s = await fetchState();
+    if (myId() !== uid) return; // logged out / switched user while in flight
+    if (seq === writeSeq && state.pendingWrites === 0) {
+      Object.assign(state, s);
+    } else {
+      // A write raced this snapshot: server rows underneath, local rows on top.
+      const trophy = { ...s.trophy };
+      if (state.trophy[uid]) {
+        trophy[uid] = { ...(s.trophy[uid] ?? {}),
+          ...Object.fromEntries(Object.entries(state.trophy[uid]).filter(([, v]) => v != null)) };
+      }
+      Object.assign(state, {
+        ballots: s.ballots, profiles: s.profiles,
+        picks: { ...s.picks, ...state.picks },
+        submissions: { ...s.submissions, ...state.submissions },
+        trophy,
+      });
+    }
+    state.stateLoaded = true;
+  } catch (e) {
+    if (myId() !== uid) return;
+    console.warn('state load failed', e);
+    if (loggedOut(e)) {
+      state.picks = {}; state.submissions = {}; state.trophy = {};
+      openAuth('login');
+    } else if (!state.stateLoaded) {
+      toast('No connection — retrying');
+    }
+  }
+}
+
 /* ---------- boot ---------- */
 
 async function boot() {
+  const link = handleAuthHash();
   state.matches = await loadSchedule();
   render();
-  askName();
-  try {
-    [state.votes, state.specials, state.guesses] = await Promise.all([
-      fetchVotes(), fetchSpecials(), fetchGuesses(),
-    ]);
-  } catch (e) { console.warn(e); }
-  refreshScores(state.matches).then(() => { state.scoresLoaded = true; render(); });
+
+  if (link?.type === 'recovery') {
+    openAuth('reset');
+  } else if (link?.type === 'error') {
+    toast(link.message || 'Link expired — request a new one');
+    if (!me()) openAuth(online() ? 'login' : 'local');
+  } else if (link?.type) {
+    toast('Email confirmed ✓ — welcome', 'ok');
+    await loadProfile().catch(() => {});
+  } else if (!me()) {
+    openAuth(online() ? 'login' : 'local');
+  } else if (online()) {
+    loadProfile().then(render).catch(e => { if (loggedOut(e)) openAuth('login'); });
+  }
+
+  await loadState();
   render();
-  // Top-scorer board loads in the background (cached per match) and shows when ready.
-  fetchTopScorers().then(race => { state.scorerRace = race; render(); }).catch(e => console.warn('scorers', e));
+  if ('ResizeObserver' in window) new ResizeObserver(syncHeader).observe(document.querySelector('header'));
+  else window.addEventListener('resize', syncHeader);
+
+  refreshScores(state.matches, { full: true }).then(() => { state.scoresLoaded = true; render(); });
+  fetchStandings().then(rows => { if (rows) { state.table = rows; render(); } });
+
   setInterval(async () => {
     try {
-      const [votes, specials, guesses, , race] = await Promise.all([
-        fetchVotes(), fetchSpecials(), fetchGuesses(), refreshScores(state.matches), fetchTopScorers(),
-      ]);
-      state.votes = votes;
-      state.specials = specials;
-      state.guesses = guesses;
-      if (race) state.scorerRace = race;
+      await Promise.all([refreshScores(state.matches), loadState()]);
       render();
-    } catch (e) { console.warn('refresh failed', e); }
+    } catch (e) {
+      console.warn('refresh failed', e);
+    }
   }, CONFIG.REFRESH_MS);
+  setInterval(async () => {
+    await refreshScores(state.matches, { full: true }).catch(() => {});
+    const rows = await fetchStandings();
+    if (rows) state.table = rows;
+    render();
+  }, CONFIG.FULL_REFRESH_MS);
 }
 
 boot();

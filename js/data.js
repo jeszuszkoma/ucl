@@ -1,250 +1,241 @@
 import { CONFIG } from './config.js';
-import { fromFdName } from './teams.js';
+import { setTeams, teamByEspnId, isPlaceholder } from './teams.js';
 
-const OPENFOOTBALL_URL =
-  'https://raw.githubusercontent.com/openfootball/worldcup.json/master/2026/worldcup.json';
+// ------------------------------------------------------------ constants
 
-export const KO_ROUNDS = [
-  'Round of 32', 'Round of 16', 'Quarter-final', 'Semi-final',
-  'Match for third place', 'Final',
-];
+export const KO_ROUNDS = ['Knockout play-off', 'Round of 16', 'Quarter-final', 'Semi-final', 'Final'];
 
-// "13:00 UTC-6" + "2026-06-11" -> Date in the viewer's local timezone.
-export function kickoff(match) {
-  const m = match.time.match(/^(\d{2}):(\d{2}) UTC([+-]\d+)$/);
-  if (!m) return new Date(`${match.date}T${match.time || '00:00'}:00Z`);
+export const PHASE_LABEL = {
+  league: 'League phase', playoff: 'Knockout play-off', r16: 'Round of 16',
+  qf: 'Quarter-finals', sf: 'Semi-finals', final: 'Final',
+};
+
+const ESPN = 'https://site.api.espn.com/apis/site/v2/sports/soccer/uefa.champions';
+const ESPN_STANDINGS = 'https://site.api.espn.com/apis/v2/sports/soccer/uefa.champions/standings';
+// Full-season windows (league phase, knockouts). limit= lifts ESPN's 100-event cap.
+const FULL_WINDOWS = ['20260901-20270131', '20270201-20270630'];
+
+// ------------------------------------------------------------ match helpers
+
+// "16:45 UTC+0" + "2026-09-08" -> Date (viewer's local timezone).
+function parseKickoff(date, time) {
+  const m = (time ?? '').match(/^(\d{2}):(\d{2}) UTC([+-]\d+)$/);
+  if (!m) return new Date(`${date}T${time || '00:00'}:00Z`);
   const [, hh, mm, off] = m;
-  const sign = off.startsWith('-') ? '+' : '-'; // ISO offset is inverse of "UTC-6" shift
   const pad = String(Math.abs(parseInt(off, 10))).padStart(2, '0');
-  return new Date(`${match.date}T${hh}:${mm}:00${off.startsWith('-') ? '-' : '+'}${pad}:00`);
+  return new Date(`${date}T${hh}:${mm}:00${off.startsWith('-') ? '-' : '+'}${pad}:00`);
+}
+
+// Live kickoff: ESPN may move a match (postponement). Used for display + status.
+export function kickoff(match) {
+  return parseKickoff(match.espnDate ?? match.date, match.espnTime ?? match.time);
+}
+
+// Bundled kickoff: what the server's `matches` table holds. Decides ballot
+// membership, so the browser and the RLS policy agree even if ESPN moves a game
+// before the admin re-syncs the schedule.
+export function scheduledKickoff(match) {
+  return parseKickoff(match.date, match.time);
 }
 
 export function isKnockout(match) {
-  return !match.group;
+  return match.phase !== 'league';
+}
+
+// The final is a single match decided on the night: pick the winner (1 / 2).
+// Every other match (league, two-legged ties) is a plain 1 / X / 2.
+export function isWinnerOnly(match) {
+  return match.phase === 'final';
+}
+
+export function options(match) {
+  return isWinnerOnly(match) ? ['1', '2'] : ['1', 'X', '2'];
+}
+
+export function placeholder(match) {
+  return isPlaceholder(match.team1) || isPlaceholder(match.team2);
 }
 
 // 'scheduled' | 'live' | 'finished'
 export function status(match, now = new Date()) {
-  if (match._live) return 'live'; // live feed says in play — score present but not final
+  if (match._live) return 'live';
   if (match.score?.ft) return 'finished';
   const ko = kickoff(match);
-  const liveWindowMs = isKnockout(match) ? 150 * 60_000 : 120 * 60_000; // ET+pens headroom
+  const liveWindowMs = isKnockout(match) ? 150 * 60_000 : 120 * 60_000;
   if (now >= ko && now - ko < liveWindowMs) return 'live';
-  if (now >= ko) return 'finished'; // past, no score yet -> treat as done/awaiting result
+  if (now >= ko) return 'finished'; // past, no score yet -> awaiting result
   return 'scheduled';
 }
 
-// Knockout slots like "1A", "2B", "W73", "L101", "3A/B/C/D/F" are not votable yet.
-const SLOT = /^([WL]\d+|\d[A-L])$|\//;
-export function placeholder(match) {
-  return SLOT.test(match.team1) || SLOT.test(match.team2);
-}
-
-const EARLY_OPEN_MS = 12 * 3_600_000;
-
-// Voting unlocks at local midnight of matchday, or 12h before kickoff for
-// early-morning matches — whichever comes first.
-export function unlockTime(match) {
-  const ko = kickoff(match);
-  const midnight = new Date(ko);
-  midnight.setHours(0, 0, 0, 0);
-  const early = new Date(ko.getTime() - EARLY_OPEN_MS);
-  return early < midnight ? early : midnight;
-}
-
-export function votingOpen(match, now = new Date()) {
-  return now >= unlockTime(match) && now < kickoff(match) && !placeholder(match);
-}
-
-// Total goals per side incl. extra time (pens excluded — shown separately).
+// Final score incl. extra time, always as [team1, team2]; pens shown separately.
 export function goals(match) {
   const s = match.score;
   if (!s?.ft) return null;
-  const ft = s.et ?? s.ft; // openfootball: et totals include ft
-  return { home: ft[0], away: ft[1], pens: s.p ?? null };
+  return { home: s.ft[0], away: s.ft[1], pens: s.p ?? null, et: Boolean(s.et) };
 }
 
-// Regular-time (90') score only — EXACT guesses judge on this, betting style.
-// openfootball keeps ft = 90' even when et/p exist. ftIsTotal means the feed
-// only gave us the 120' total — real 90' split unknown yet, so judge nothing.
-export function goals90(match) {
-  const s = match.score;
-  if (!s?.ft || s.ftIsTotal) return null;
-  return { home: s.ft[0], away: s.ft[1] };
-}
-
-// '1' | 'X' | '2' for a finished match; knockout uses pens/et to break ties.
+// '1' | 'X' | '2' for a finished match, null when undecided.
+//  - league + two-legged ties: result of the match incl. extra time, a tie is X
+//    (a shootout after a drawn 2nd leg does not change the match result)
+//  - final: winner; level without a shootout score yet = undecided (null)
 export function outcome(match) {
   const g = goals(match);
   if (!g) return null;
   if (g.home !== g.away) return g.home > g.away ? '1' : '2';
-  if (g.pens) return g.pens[0] > g.pens[1] ? '1' : '2';
+  if (isWinnerOnly(match)) return g.pens ? (g.pens[0] > g.pens[1] ? '1' : '2') : null;
   return 'X';
 }
 
-// openfootball numbers most knockout matches but not group games (nor, today,
-// the 3rd-place match and final). Stable ids by kickoff order so votes keep
-// pointing at the same match across refreshes:
-//   group matches -> 1..72, unnumbered knockout -> after the highest known num.
-function assignNums(matches) {
-  const byKickoff = (a, b) => kickoff(a) - kickoff(b) || a.team1.localeCompare(b.team1);
-  const groups = matches.filter(m => m.num == null && m.group).sort(byKickoff);
-  groups.forEach((m, i) => { m.num = i + 1; });
-  let next = Math.max(72, ...matches.map(m => m.num ?? 0)) + 1;
-  const ko = matches.filter(m => m.num == null).sort(byKickoff);
-  ko.forEach(m => { m.num = next++; });
-  return matches;
-}
+// ------------------------------------------------------------ schedule
 
 export async function loadSchedule() {
-  // Bundled copy first (instant paint), then freshen from the network.
-  const local = await fetch('./data/worldcup2026.json').then(r => r.json());
-  return assignNums(local.matches);
+  const data = await fetch('./data/ucl2027.json', { cache: 'no-cache' }).then(r => r.json());
+  setTeams(data.teams);
+  return data.matches;
 }
 
-const ESPN_URL =
-  'https://site.api.espn.com/apis/site/v2/sports/soccer/fifa.world/scoreboard';
+// ------------------------------------------------------------ ESPN scores
 
-// yesterday..tomorrow as "YYYYMMDD-YYYYMMDD" — catches venue-timezone drift.
-function espnDates(now = new Date()) {
+// ESPN feeds occasionally leak raw control characters that break JSON.parse.
+const CTRL = new RegExp('[' + String.fromCharCode(0) + '-' + String.fromCharCode(31) + ']', 'g');
+async function espnJson(url) {
+  const txt = await fetch(url).then(r => {
+    if (!r.ok) throw new Error(`ESPN ${r.status}`);
+    return r.text();
+  });
+  return JSON.parse(txt.replace(CTRL, ' '));
+}
+
+// yesterday..tomorrow as "YYYYMMDD-YYYYMMDD" - catches venue-timezone drift.
+function nearDates(now = new Date()) {
   const fmt = d => d.toISOString().slice(0, 10).replaceAll('-', '');
   return `${fmt(new Date(now - 86_400_000))}-${fmt(new Date(+now + 86_400_000))}`;
 }
 
-export async function refreshScores(matches) {
-  let updated = false;
-  // Optional proxy (football-data.org via Supabase edge function).
-  if (CONFIG.SCORES_URL) {
-    try {
-      const fd = await fetch(CONFIG.SCORES_URL).then(r => r.json());
-      updated = mergeFootballData(matches, fd) || updated;
-    } catch (e) {
-      console.warn('scores proxy failed, falling back to openfootball', e);
-    }
-  }
-  // openfootball — full-tournament history, updated ~daily upstream.
-  try {
-    const fresh = await fetch(OPENFOOTBALL_URL, { cache: 'no-cache' }).then(r => r.json());
-    updated = mergeOpenfootball(matches, fresh.matches) || updated;
-  } catch (e) {
-    console.warn('openfootball refresh failed', e);
-  }
-  // ESPN — live scores around today; merged last so the freshest source wins.
-  try {
-    const espn = await fetch(`${ESPN_URL}?dates=${espnDates()}`).then(r => r.json());
-    updated = mergeEspn(matches, espn) || updated;
-  } catch (e) {
-    console.warn('espn scores failed', e);
-  }
-  return updated;
+// Pulls are serialised (the 10-minute full pull and the 60-second near pull
+// share the same match objects) and every merge is stamped with a sequence
+// number taken when its request started, so an older reply can never
+// overwrite a fresher one (a monotonic counter, immune to clock steps).
+let chain = Promise.resolve();
+let pullSeq = 0;
+export function refreshScores(matches, opts = {}) {
+  const run = chain.then(() => doRefresh(matches, opts));
+  chain = run.catch(() => {});
+  return run;
 }
 
-/* ---- Gólkirály race: tournament top-scorer tally from ESPN summaries ---- */
-
-const ESPN_SUMMARY =
-  'https://site.api.espn.com/apis/site/v2/sports/soccer/fifa.world/summary';
-const LS_SCORER_CACHE = 'wc26.scorerCache'; // { "<eventId>": ["Scorer", ...] }
-
-// ESPN feeds occasionally contain raw control characters that break JSON.parse.
-// Strip the whole C0 range incl. TAB/LF/CR - illegal inside JSON string literals
-// (the real failure mode), harmless to blank out between tokens.
-async function espnJson(url) {
-  const txt = await fetch(url).then(r => r.text());
-  return JSON.parse(txt.replace(/[\u0000-\u001F]/g, ' '));
-}
-
-function loadScorerCache() {
-  try { return JSON.parse(localStorage.getItem(LS_SCORER_CACHE) || '{}'); }
-  catch { return {}; }
-}
-
-// Scoreboard is chunked because ESPN caps a reply at ~100 events. A chunk whose
-// window is entirely before today is immutable — fetch its finished-id set once
-// per session and reuse it, so the 60s refresh doesn't refetch old chunks.
-const SCOREBOARD_CHUNKS = ['20260611-20260628', '20260628-20260720'];
-const pastChunkIds = new Map(); // chunk range -> Set(finished event ids)
-
-// -> [{ name, goals }] sorted desc. Goal scorers from ESPN goal events across
-// every finished match; own goals and shootout penalties excluded. Each match
-// summary is cached (localStorage) and fetched once — only newly-finished
-// matches hit the network on later refreshes.
-export async function fetchTopScorers() {
-  const cache = loadScorerCache();
-  const today = new Date().toISOString().slice(0, 10).replaceAll('-', '');
-  const ids = new Set();
-  for (const range of SCOREBOARD_CHUNKS) {
-    const past = range.split('-')[1] < today; // window fully before today = immutable
-    if (past && pastChunkIds.has(range)) {
-      for (const id of pastChunkIds.get(range)) ids.add(id);
-      continue;
-    }
-    try {
-      const sb = await espnJson(`${ESPN_URL}?dates=${range}`);
-      const set = new Set();
-      for (const e of sb.events ?? []) {
-        if (e?.status?.type?.state === 'post') set.add(e.id);
-      }
-      if (past) pastChunkIds.set(range, set); // memoize immutable chunk
-      for (const id of set) ids.add(id);
-    } catch (e) { console.warn('scorer scoreboard chunk failed', range, e); }
-  }
-  // Fetch summaries for finished matches not yet cached. Empty entries are
-  // retried — a summary can be momentarily goalless right at the final whistle.
-  const missing = [...ids].filter(id => !cache[id] || cache[id].length === 0);
-  await Promise.all(missing.map(async id => {
-    try {
-      const s = await espnJson(`${ESPN_SUMMARY}?event=${id}`);
-      const names = [];
-      for (const k of s.keyEvents ?? []) {
-        if (!k.scoringPlay || k.shootout) continue;      // exclude shootout pens
-        if ((k.type?.text ?? '') === 'Own Goal') continue; // exclude own goals
-        const nm = k.participants?.[0]?.athlete?.displayName; // [0] = scorer
-        if (nm) names.push(nm);
-      }
-      cache[id] = names;
-    } catch (e) { console.warn('summary fetch failed', id, e); }
-  }));
-  try { localStorage.setItem(LS_SCORER_CACHE, JSON.stringify(cache)); } catch (e) { /* quota */ }
-  // Tally only the matches currently seen as finished.
-  const tally = new Map();
-  for (const id of ids) for (const nm of cache[id] ?? []) {
-    tally.set(nm, (tally.get(nm) ?? 0) + 1);
-  }
-  return [...tally].map(([name, goals]) => ({ name, goals }))
-    .sort((a, b) => b.goals - a.goals || a.name.localeCompare(b.name));
-}
-
-function mergeOpenfootball(matches, fresh) {
+async function doRefresh(matches, { full = false } = {}) {
+  const urls = full
+    ? FULL_WINDOWS.map(w => `${ESPN}/scoreboard?dates=${w}&limit=1000`)
+    : [`${ESPN}/scoreboard?dates=${nearDates()}&limit=500`];
   let changed = false;
-  assignNums(fresh);
-  const byNum = new Map(matches.map(m => [m.num, m]));
-  for (const f of fresh) {
-    const m = byNum.get(f.num);
-    if (!m) continue;
-    if (f.score && JSON.stringify(f.score) !== JSON.stringify(m.score)) {
-      m.score = f.score;
-      changed = true;
-    }
-    // Knockout slots fill in as groups finish (e.g. "1A" -> "France").
-    if (f.team1 !== m.team1 || f.team2 !== m.team2) {
-      m.team1 = f.team1; m.team2 = f.team2;
-      changed = true;
-    }
-    // Goal lists (scorer names) appear as matches finish — gólkirály source.
-    if (JSON.stringify(f.goals1 ?? null) !== JSON.stringify(m.goals1 ?? null) ||
-        JSON.stringify(f.goals2 ?? null) !== JSON.stringify(m.goals2 ?? null)) {
-      m.goals1 = f.goals1; m.goals2 = f.goals2;
-      changed = true;
+  for (const url of urls) {
+    const at = ++pullSeq;
+    try {
+      const sb = await espnJson(url);
+      changed = mergeEspn(matches, sb, at) || changed;
+    } catch (e) {
+      console.warn('espn scores failed', url, e);
     }
   }
   return changed;
 }
 
-// Top-scorer tally from openfootball goal lists. Own goals excluded.
-// -> [{ name, goals }] sorted desc, or null when no scorer data yet.
+// Merge ESPN scoreboard events into our matches (by ESPN event id).
+// Writes score / _live / goals lists in memory only. Returns true on change.
+// Scores and goals are attributed by TEAM, not by ESPN's home/away flag: picks
+// are positional (1 = team1) and the schedule keeps its stored orientation
+// even if ESPN later swaps home and away.
+function mergeEspn(matches, espn, at = ++pullSeq) {
+  if (!espn?.events) return false;
+  const byEspn = new Map(matches.map(m => [String(m.espn), m]));
+  const nameOf = c => teamByEspnId(c?.team?.id) ?? c?.team?.displayName ?? null;
+  let changed = false;
+  for (const ev of espn.events) {
+    const m = byEspn.get(String(ev.id));
+    if (!m) continue;
+    if (m._at && m._at > at) continue; // a fresher reply already landed
+    m._at = at;
+    const comp = ev.competitions?.[0];
+    if (!comp?.competitors) continue;
+    const hc = comp.competitors.find(c => c.homeAway === 'home');
+    const ac = comp.competitors.find(c => c.homeAway === 'away');
+    if (!hc || !ac) continue;
+
+    // Team names fill in once a draw is made - only ever replace placeholders.
+    // A placeholder slot takes whichever competitor is NOT the team already
+    // stored on the other side (ESPN may have re-oriented the event since).
+    const home = nameOf(hc), away = nameOf(ac);
+    const fill1 = home === m.team2 ? away : home;
+    const fill2 = away === m.team1 ? home : away;
+    if (fill1 && isPlaceholder(m.team1) && !isPlaceholder(fill1) && fill1 !== m.team2) { m.team1 = fill1; changed = true; }
+    if (fill2 && isPlaceholder(m.team2) && !isPlaceholder(fill2) && fill2 !== m.team1) { m.team2 = fill2; changed = true; }
+
+    // Map ESPN's two competitors onto our team1 / team2: a side that resolves
+    // by name wins; the other side gets the remaining competitor; if neither
+    // resolves (both placeholders) fall back to ESPN's home/away order.
+    const m1 = comp.competitors.find(c => nameOf(c) === m.team1);
+    const m2 = comp.competitors.find(c => nameOf(c) === m.team2 && c !== m1);
+    const c1 = m1 ?? (m2 ? (m2 === hc ? ac : hc) : hc);
+    const c2 = m2 ?? (c1 === hc ? ac : hc);
+
+    // Kickoff can move (postponements): keep the bundled one, remember ESPN's.
+    if (ev.date && ev.date.length >= 16) {
+      const d = new Date(ev.date);
+      const date = ev.date.slice(0, 10);
+      const time = `${String(d.getUTCHours()).padStart(2, '0')}:${String(d.getUTCMinutes()).padStart(2, '0')} UTC+0`;
+      const moved = date !== m.date || time !== m.time;
+      if (moved && (m.espnDate !== date || m.espnTime !== time)) { m.espnDate = date; m.espnTime = time; changed = true; }
+      if (!moved && m.espnDate) { delete m.espnDate; delete m.espnTime; changed = true; }
+    }
+
+    // 'pre' | 'in' | 'post'. Abandoned / postponed / cancelled fixtures also
+    // come back as 'post' but with completed:false and a 0-0 - never a result.
+    const type = comp.status?.type;
+    const st = type?.state;
+    const done = st === 'post' && type?.completed === true;
+    if (st !== 'in' && !done) {
+      if (m._live) { delete m._live; changed = true; }
+      if (m.score) { delete m.score; changed = true; }
+      continue;
+    }
+    const h = Number(c1.score), a = Number(c2.score);
+    if (!Number.isFinite(h) || !Number.isFinite(a)) continue;
+    const score = { ft: [h, a] };
+    if ((comp.status?.period ?? 0) > 2) score.et = true;
+    const sh = Number(c1.shootoutScore), sa = Number(c2.shootoutScore);
+    if (Number.isFinite(sh) && Number.isFinite(sa) && sh + sa > 0) score.p = [sh, sa];
+    if (JSON.stringify(score) !== JSON.stringify(m.score)) { m.score = score; changed = true; }
+
+    const live = st === 'in';
+    if (live !== Boolean(m._live)) changed = true;
+    if (live) m._live = true; else delete m._live;
+
+    // Goal scorers ride along in the scoreboard - no per-match call needed.
+    if (Array.isArray(comp.details)) {
+      const g1 = [], g2 = [];
+      for (const k of comp.details) {
+        if (!k.scoringPlay || k.shootout) continue;
+        const name = k.athletesInvolved?.[0]?.displayName;
+        if (!name) continue;
+        const entry = { name, owngoal: Boolean(k.ownGoal), minute: k.clock?.displayValue ?? '' };
+        (String(k.team?.id) === String(c1.team?.id) ? g1 : g2).push(entry);
+      }
+      if (JSON.stringify(g1) !== JSON.stringify(m.goals1 ?? []) ||
+          JSON.stringify(g2) !== JSON.stringify(m.goals2 ?? [])) {
+        m.goals1 = g1; m.goals2 = g2; changed = true;
+      }
+    }
+  }
+  return changed;
+}
+
+// Tournament top-scorer tally from the goal lists of finished matches.
+// Own goals and shootout penalties excluded. -> [{ name, goals }] or null.
 export function topScorers(matches) {
   const tally = new Map();
   for (const m of matches) {
+    if (!m.score?.ft || m._live) continue;
     for (const g of [...(m.goals1 ?? []), ...(m.goals2 ?? [])]) {
       if (g.owngoal || !g.name) continue;
       tally.set(g.name, (tally.get(g.name) ?? 0) + 1);
@@ -256,98 +247,10 @@ export function topScorers(matches) {
     .sort((a, b) => b.goals - a.goals || a.name.localeCompare(b.name));
 }
 
-// football-data.org v4 /competitions/WC/matches payload -> our match list.
-function mergeFootballData(matches, fd) {
-  if (!fd?.matches) return false;
-  let changed = false;
-  for (const fm of fd.matches) {
-    const home = fromFdName(fm.homeTeam?.name);
-    const away = fromFdName(fm.awayTeam?.name);
-    if (!home || !away) continue;
-    const day = (fm.utcDate || '').slice(0, 10);
-    const m = matches.find(x =>
-      x.team1 === home && x.team2 === away &&
-      Math.abs(new Date(x.date) - new Date(day)) <= 86_400_000); // venue-tz date drift
-    if (!m) continue;
-    const ft = fm.score?.fullTime;
-    if (ft && ft.home != null) {
-      const score = { ft: [ft.home, ft.away] };
-      const et = fm.score?.extraTime;
-      const p = fm.score?.penalties;
-      // fd extraTime/penalties are period-only; ft already holds the 120' total
-      if (fm.score?.duration === 'EXTRA_TIME' || fm.score?.duration === 'PENALTY_SHOOTOUT') {
-        score.et = [ft.home, ft.away];
-      }
-      if (p && p.home != null) score.p = [p.home, p.away];
-      if (JSON.stringify(score) !== JSON.stringify(m.score)) {
-        m.score = score;
-        changed = true;
-      }
-      if (fm.status === 'IN_PLAY' || fm.status === 'PAUSED') {
-        // live: show running score but don't mark finished
-        m._live = true;
-      } else {
-        delete m._live;
-      }
-    }
-  }
-  return changed;
-}
+// ------------------------------------------------------------ standings
 
-// ESPN scoreboard payload -> our match list. Display-only merge: writes
-// score + _live flag on in-memory matches, never touches stored votes.
-function mergeEspn(matches, espn) {
-  if (!espn?.events) return false;
-  let changed = false;
-  for (const ev of espn.events) {
-    const comp = ev.competitions?.[0];
-    if (!comp?.competitors) continue;
-    const hc = comp.competitors.find(c => c.homeAway === 'home');
-    const ac = comp.competitors.find(c => c.homeAway === 'away');
-    const home = fromFdName(hc?.team?.displayName);
-    const away = fromFdName(ac?.team?.displayName);
-    if (!home || !away) continue;
-    const day = (ev.date || '').slice(0, 10);
-    const m = matches.find(x =>
-      x.team1 === home && x.team2 === away &&
-      Math.abs(new Date(x.date) - new Date(day)) <= 86_400_000); // venue-tz date drift
-    if (!m) continue;
-    const st = comp.status?.type?.state; // 'pre' | 'in' | 'post'
-    if (st !== 'in' && st !== 'post') continue;
-    const h = Number(hc.score), a = Number(ac.score);
-    if (!Number.isFinite(h) || !Number.isFinite(a)) continue;
-    const score = { ft: [h, a] };
-    if ((comp.status?.period ?? 0) > 2) {
-      // Extra time: ft must stay the 90' score. ESPN's scoreboard often omits
-      // linescores on finished matches, so prefer them when present, else keep
-      // openfootball's 90' split (merged just before us — never clobber it),
-      // else flag ft as a 120' total so goals90()/EXACT wait for the real split.
-      const reg = c => (c.linescores ?? []).slice(0, 2)
-        .reduce((s, l) => s + Number(l.value ?? 0), 0);
-      if (hc.linescores?.length >= 2 && ac.linescores?.length >= 2) {
-        score.ft = [reg(hc), reg(ac)];
-      } else if (m.score?.et && m.score?.ft) {
-        score.ft = m.score.ft;
-      } else {
-        score.ftIsTotal = true;
-      }
-      score.et = [h, a]; // periods 3+4 = extra time, et = 120' total
-    }
-    const sh = Number(hc.shootoutScore), sa = Number(ac.shootoutScore);
-    if (Number.isFinite(sh) && Number.isFinite(sa) && sh + sa > 0) score.p = [sh, sa];
-    if (JSON.stringify(score) !== JSON.stringify(m.score)) {
-      m.score = score;
-      changed = true;
-    }
-    const live = st === 'in';
-    if (live !== Boolean(m._live)) changed = true;
-    if (live) m._live = true; else delete m._live;
-  }
-  return changed;
-}
-
-// Group standings from finished matches. FIFA rules subset: pts, GD, GF.
-export function standings(matches, group) {
+// Computed fallback: points, goal difference, goals for.
+export function standings(matches, group = 'League Phase') {
   const rows = new Map();
   const ensure = t => {
     if (!rows.has(t)) rows.set(t, { team: t, p: 0, w: 0, d: 0, l: 0, gf: 0, ga: 0, pts: 0 });
@@ -357,7 +260,7 @@ export function standings(matches, group) {
     if (m.group !== group) continue;
     ensure(m.team1); ensure(m.team2);
     const g = goals(m);
-    if (!g) continue;
+    if (!g || m._live) continue;
     const a = rows.get(m.team1), b = rows.get(m.team2);
     a.p++; b.p++;
     a.gf += g.home; a.ga += g.away;
@@ -366,6 +269,30 @@ export function standings(matches, group) {
     else if (g.home < g.away) { b.w++; a.l++; b.pts += 3; }
     else                      { a.d++; b.d++; a.pts++; b.pts++; }
   }
-  return [...rows.values()].sort((x, y) =>
-    y.pts - x.pts || (y.gf - y.ga) - (x.gf - x.ga) || y.gf - x.gf || x.team.localeCompare(y.team));
+  return [...rows.values()]
+    .sort((x, y) => y.pts - x.pts || (y.gf - y.ga) - (x.gf - x.ga) || y.gf - x.gf || x.team.localeCompare(y.team))
+    .map((r, i) => ({ ...r, rank: i + 1 }));
+}
+
+// Official 36-team table from ESPN (rank + qualification note). null on failure.
+export async function fetchStandings() {
+  try {
+    const d = await espnJson(ESPN_STANDINGS);
+    const entries = d?.children?.[0]?.standings?.entries;
+    if (!Array.isArray(entries) || !entries.length) return null;
+    const rows = entries.map(e => {
+      const s = Object.fromEntries((e.stats ?? []).map(x => [x.name, Number(x.value)]));
+      return {
+        team: teamByEspnId(e.team?.id) ?? e.team?.displayName,
+        rank: s.rank, p: s.gamesPlayed, w: s.wins, d: s.ties, l: s.losses,
+        gf: s.pointsFor, ga: s.pointsAgainst, pts: s.points,
+        note: e.note?.description ?? '',
+      };
+    }).filter(r => r.team && Number.isFinite(r.rank));
+    rows.sort((a, b) => a.rank - b.rank);
+    return rows.length ? rows : null;
+  } catch (e) {
+    console.warn('espn standings failed', e);
+    return null;
+  }
 }

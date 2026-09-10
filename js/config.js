@@ -1,22 +1,31 @@
-// Fill these after creating the Supabase project (see SETUP.md).
-// Empty values = app runs in local mode (votes stay on this device only).
+// App configuration. See SETUP.md for the Supabase steps.
+// Empty SUPABASE_* values = local mode (single device, no accounts) - handy
+// for development, not for playing with friends.
 export const CONFIG = {
   SUPABASE_URL: 'https://wwbovzfjoiuxzfehkqut.supabase.co',
   SUPABASE_ANON_KEY: 'sb_publishable_t-CWzc_hRSDsW2Y8ebJQPA_ao7gx8cn', // public by design
-  // Optional live-score proxy (Supabase edge function wrapping football-data.org).
-  // Empty = scores come from openfootball (updated ~daily).
-  SCORES_URL: '',          // e.g. 'https://abcdefgh.supabase.co/functions/v1/scores'
-  // Points for a correct pick.
-  POINTS_GROUP: 3,
-  POINTS_KO: 3,
-  POINTS_CHAMPION: 20,   // correct World Cup winner pick
-  POINTS_TOP_SCORER: 20, // correct gólkirály (top scorer) pick
-  POINTS_EXACT: 5,       // exact score guess (stacks with the 1X2 pick: 3+5=8)
-  SHOW_FINAL_SCORE: false, // Trophy tab free-text final score — hidden for now
-  // Tournament top scorer(s) — manual override for end-of-tournament scoring
-  // if openfootball goal lists are missing/late. e.g. ['Kylian Mbappé']
+  // Edge function that logs in with username + password (keeps emails private).
+  // Empty = login with email only, straight against Supabase Auth.
+  LOGIN_URL: 'https://wwbovzfjoiuxzfehkqut.supabase.co/functions/v1/login',
+  // Where confirmation / password-reset emails send people back to.
+  SITE_URL: 'https://jeszuszkoma.github.io/wc26/',
+
+  // Points.
+  POINTS_MATCH: 3,        // correct 1 / X / 2 (league and knockout alike)
+  POINTS_CHAMPION: 20,    // correct Champions League winner
+  POINTS_TOP_SCORER: 20,  // correct gólkirály (tournament top scorer)
+
+  // Manual override for the final top-scorer verdict if the feed is late or
+  // wrong at the end of the season. e.g. ['Kylian Mbappé']
   TOP_SCORERS: [],
 
-  // How often to refresh scores + votes while the app is open (ms).
+  // How often to refresh scores + picks while the app is open (ms).
   REFRESH_MS: 60_000,
+  // Full-season score pull (bigger payload) - on boot, then every N ms.
+  FULL_REFRESH_MS: 10 * 60_000,
+
+  // Local-mode ballots (no Supabase). Mirrors what supabase/matches.sql seeds.
+  LOCAL_BALLOTS: {
+    league: { label: 'League phase', opens_at: '2026-09-01T00:00:00Z', locks_at: '2026-10-13T16:45:00Z' },
+  },
 };

@@ -1,67 +1,70 @@
-// Team metadata: flag emoji + football-data.org name aliases.
-// Keys match openfootball team names exactly.
-export const TEAMS = {
-  'Algeria':              { flag: '🇩🇿', fd: ['Algeria'] },
-  'Argentina':            { flag: '🇦🇷', fd: ['Argentina'] },
-  'Australia':            { flag: '🇦🇺', fd: ['Australia'] },
-  'Austria':              { flag: '🇦🇹', fd: ['Austria'] },
-  'Belgium':              { flag: '🇧🇪', fd: ['Belgium'] },
-  'Bosnia & Herzegovina': { flag: '🇧🇦', fd: ['Bosnia and Herzegovina', 'Bosnia-Herzegovina'] },
-  'Brazil':               { flag: '🇧🇷', fd: ['Brazil'] },
-  'Canada':               { flag: '🇨🇦', fd: ['Canada'] },
-  'Cape Verde':           { flag: '🇨🇻', fd: ['Cape Verde', 'Cape Verde Islands', 'Cabo Verde'] },
-  'Colombia':             { flag: '🇨🇴', fd: ['Colombia'] },
-  'Croatia':              { flag: '🇭🇷', fd: ['Croatia'] },
-  'Curaçao':              { flag: '🇨🇼', fd: ['Curaçao', 'Curacao'] },
-  'Czech Republic':       { flag: '🇨🇿', fd: ['Czech Republic', 'Czechia'] },
-  'DR Congo':             { flag: '🇨🇩', fd: ['DR Congo', 'Congo DR', 'Democratic Republic of the Congo'] },
-  'Ecuador':              { flag: '🇪🇨', fd: ['Ecuador'] },
-  'Egypt':                { flag: '🇪🇬', fd: ['Egypt'] },
-  'England':              { flag: '🏴󠁧󠁢󠁥󠁮󠁧󠁿', fd: ['England'] },
-  'France':               { flag: '🇫🇷', fd: ['France'] },
-  'Germany':              { flag: '🇩🇪', fd: ['Germany'] },
-  'Ghana':                { flag: '🇬🇭', fd: ['Ghana'] },
-  'Haiti':                { flag: '🇭🇹', fd: ['Haiti'] },
-  'Iran':                 { flag: '🇮🇷', fd: ['Iran', 'IR Iran'] },
-  'Iraq':                 { flag: '🇮🇶', fd: ['Iraq'] },
-  'Ivory Coast':          { flag: '🇨🇮', fd: ['Ivory Coast', "Côte d'Ivoire", 'Cote d Ivoire'] },
-  'Japan':                { flag: '🇯🇵', fd: ['Japan'] },
-  'Jordan':               { flag: '🇯🇴', fd: ['Jordan'] },
-  'Mexico':               { flag: '🇲🇽', fd: ['Mexico'] },
-  'Morocco':              { flag: '🇲🇦', fd: ['Morocco'] },
-  'Netherlands':          { flag: '🇳🇱', fd: ['Netherlands', 'Holland'] },
-  'New Zealand':          { flag: '🇳🇿', fd: ['New Zealand'] },
-  'Norway':               { flag: '🇳🇴', fd: ['Norway'] },
-  'Panama':               { flag: '🇵🇦', fd: ['Panama'] },
-  'Paraguay':             { flag: '🇵🇾', fd: ['Paraguay'] },
-  'Portugal':             { flag: '🇵🇹', fd: ['Portugal'] },
-  'Qatar':                { flag: '🇶🇦', fd: ['Qatar'] },
-  'Saudi Arabia':         { flag: '🇸🇦', fd: ['Saudi Arabia'] },
-  'Scotland':             { flag: '🏴󠁧󠁢󠁳󠁣󠁴󠁿', fd: ['Scotland'] },
-  'Senegal':              { flag: '🇸🇳', fd: ['Senegal'] },
-  'South Africa':         { flag: '🇿🇦', fd: ['South Africa'] },
-  'South Korea':          { flag: '🇰🇷', fd: ['South Korea', 'Korea Republic'] },
-  'Spain':                { flag: '🇪🇸', fd: ['Spain'] },
-  'Sweden':               { flag: '🇸🇪', fd: ['Sweden'] },
-  'Switzerland':          { flag: '🇨🇭', fd: ['Switzerland'] },
-  'Tunisia':              { flag: '🇹🇳', fd: ['Tunisia'] },
-  'Turkey':               { flag: '🇹🇷', fd: ['Turkey', 'Türkiye', 'Turkiye'] },
-  'USA':                  { flag: '🇺🇸', fd: ['USA', 'United States', 'United States of America'] },
-  'Uruguay':              { flag: '🇺🇾', fd: ['Uruguay'] },
-  'Uzbekistan':           { flag: '🇺🇿', fd: ['Uzbekistan'] },
+// Team metadata comes from data/ucl2027.json (built from ESPN): crest URL,
+// short name, abbreviation, ESPN id. Populated once at boot via setTeams().
+
+export let TEAMS = {};          // displayName -> { short, abbr, espnId, logo, color }
+let BY_ESPN_ID = new Map();     // espnId -> displayName
+
+export function setTeams(list) {
+  TEAMS = {};
+  BY_ESPN_ID = new Map();
+  for (const t of list ?? []) {
+    TEAMS[t.name] = t;
+    if (t.espnId) BY_ESPN_ID.set(String(t.espnId), t.name);
+  }
+}
+
+export function teamByEspnId(id) {
+  return BY_ESPN_ID.get(String(id)) ?? null;
+}
+
+// Knockout placeholders before a draw: "TBD Home", "Winner X", "1st ..." etc.
+// (No slash test: "Bodo/Glimt" is a real club.)
+export function isPlaceholder(name) {
+  if (!name || !/\S/.test(name)) return true;
+  return /^(tbd|tba|winner|loser|runner|1st|2nd|w\d+|l\d+)\b/i.test(name);
+}
+
+const esc = s => String(s).replace(/[&<>"']/g, c => ({
+  '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+}[c]));
+
+// Crest <img> for the team (falls back to a ball for placeholders).
+export function crest(team, cls = 'crest') {
+  const t = TEAMS[team];
+  if (!t?.logo) return `<span class="${cls} ph">⚽</span>`;
+  return `<img class="${cls}" src="${esc(t.logo)}" alt="" loading="lazy" decoding="async">`;
+}
+
+const SHORT_OVERRIDE = {
+  'Paris Saint-Germain': 'PSG',
+  'Borussia Dortmund': 'Dortmund',
+  'Manchester City': 'Man City',
+  'Manchester United': 'Man United',
+  'Atlético Madrid': 'Atlético',
+  'Feyenoord Rotterdam': 'Feyenoord',
+  'Internazionale': 'Inter',
+  'Bayern Munich': 'Bayern',
+  'Shakhtar Donetsk': 'Shakhtar',
+  'Slovan Bratislava': 'Slovan',
+  'PSV Eindhoven': 'PSV',
+  'VfB Stuttgart': 'Stuttgart',
+  'Sporting CP': 'Sporting',
+  'Slavia Prague': 'Slavia',
+  'Real Betis': 'Betis',
+  'Club Brugge': 'Brugge',
+  'Bodo/Glimt': 'Bodø/Glimt',
+  'LASK Linz': 'LASK',
+  'Viking FK': 'Viking',
+  'Sabah FK': 'Sabah',
+  'AS Roma': 'Roma',
+  'FC Porto': 'Porto',
 };
 
-export function flag(team) {
-  if (TEAMS[team]) return TEAMS[team].flag;
-  return '⚽'; // knockout placeholders like "1A", "2B", "W73"
+export function teamShort(name) {
+  if (isPlaceholder(name)) return name;
+  return SHORT_OVERRIDE[name] ?? TEAMS[name]?.short ?? name;
 }
 
-// Map a football-data.org team name back to the openfootball name.
-const FD_LOOKUP = {};
-for (const [name, meta] of Object.entries(TEAMS)) {
-  for (const alias of meta.fd) FD_LOOKUP[alias.toLowerCase()] = name;
-}
-export function fromFdName(fdName) {
-  if (!fdName) return null;
-  return FD_LOOKUP[fdName.toLowerCase()] ?? null;
+export function teamAbbr(name) {
+  return TEAMS[name]?.abbr ?? teamShort(name).slice(0, 3).toUpperCase();
 }
