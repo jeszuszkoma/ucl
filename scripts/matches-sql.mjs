@@ -43,6 +43,13 @@ for (const phase of phases) {
   if (phase === 'league') {
     const md2 = ms.find(m => m.round === 'Matchday 2') ?? ms[0];
     lock = kickoffIso(md2);
+    // The winner and top-scorer ballots open and lock with the league by
+    // default; move them afterwards with `update public.ballots set locks_at = ...`.
+    for (const [ph, lab] of [['champion', 'Champions League winner'], ['scorer', 'Gólkirály (top scorer)']]) {
+      sql += `insert into public.ballots (phase, label, opens_at, locks_at)\n`;
+      sql += `  values (${q(ph)}, ${q(lab)}, least(now(), ${q(lock)}::timestamptz - interval '1 minute'), ${q(lock)})\n`;
+      sql += `  on conflict (phase) do nothing;\n`;
+    }
   } else {
     lock = kickoffIso(ms[0]);
   }

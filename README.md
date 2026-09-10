@@ -22,8 +22,10 @@ points when you're right, top the board.
   until then, then revealed on the cards.
 - **Knockout ballots:** one per round (play-off, R16, QF, SF, final), opening
   when the draw is known and locking at the round's first kickoff.
-- **Trophy tab:** Champions League winner + gólkirály (top scorer). Part of the
-  league ballot, same lock.
+- **Trophy tab:** Champions League winner and gólkirály (top scorer) are two
+  more ballots with their own SUBMIT each, so three submits before Matchday 2.
+  They lock with the league by default; each deadline is one row in
+  `public.ballots` and can be moved separately.
 - **Scoring:** correct result 3 pts (two-legged ties: match result incl. extra
   time, shootout ignored; final: winner). Champion 20 pts. Top scorer 20 pts.
 

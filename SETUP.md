@@ -20,8 +20,9 @@ the CLI after `npx supabase@latest link --project-ref wwbovzfjoiuxzfehkqut`:
 3. Paste [`supabase/schema.sql`](supabase/schema.sql) → Run. Creates tables,
    row-level security, the signup trigger and helper functions.
 4. Paste [`supabase/matches.sql`](supabase/matches.sql) → Run. Seeds the 144
-   league-phase matches and the league ballot (opens now, locks at Matchday 2
-   kickoff, `2026-10-13T16:45:00Z`).
+   league-phase matches and the three launch ballots — league, Champions
+   League winner, gólkirály — all opening now and locking at Matchday 2
+   kickoff, `2026-10-13T16:45:00Z`.
 5. Read the invite code your friends will use (a random one is generated), or
    set your own — keep it long, the pre-check endpoint is public:
    ```sql
@@ -90,10 +91,15 @@ server, e.g. `npx http-server . -p 8087 -c-1`, then open
 
 ## Operating the game
 
-- **Schema changes:** `supabase/schema.sql` is safe to re-run (everything is
-  create-or-replace / if-not-exists). Apply it *before* pushing JavaScript that
-  depends on it - e.g. SUBMIT calls the `submit_ballot` function, and a client
-  deployed ahead of the SQL would fail every submit.
+- **Schema changes:** `supabase/schema.sql` is meant to be re-run (create-or-
+  replace / if-not-exists), with one exception: the three-ballot revision drops
+  the old combined `trophy_picks` table — if anyone had submitted champion /
+  top-scorer picks under the older single-ballot schema, copy them into
+  `champion_picks` / `scorer_picks` first. After re-running `schema.sql`, re-run
+  `matches.sql` too (it seeds the `champion` and `scorer` ballot rows). Apply
+  SQL *before* pushing JavaScript that depends on it - e.g. SUBMIT calls the
+  `submit_ballot` function, and a client deployed ahead of the SQL would fail
+  every submit.
 - **Only submitted ballots count.** Picks stay in the player's browser until
   SUBMIT; the server reveals and the board scores only rows that belong to a
   submitted ballot. A player who never submits simply has no ballot.
@@ -115,8 +121,10 @@ server, e.g. `npx http-server . -p 8087 -c-1`, then open
   result and nobody scores it. The replay appears under a new ESPN event; the
   script maps it back onto the same match number automatically (check the
   warning it prints).
-- **Move a deadline:**
+- **Move a deadline** (one row per ballot: `league`, `champion`, `scorer`, later
+  the knockout rounds):
   `update public.ballots set locks_at = '2026-10-13T16:45:00Z' where phase = 'league';`
+  `update public.ballots set locks_at = '2027-01-27T20:00:00Z' where phase in ('champion', 'scorer');`
 - **Change the invite code:** see step 1.5. **Close registration:** set the code
   to something nobody knows.
 - **Remove a player:** Authentication → Users → delete (cascades to picks).
@@ -127,7 +135,8 @@ server, e.g. `npx http-server . -p 8087 -c-1`, then open
 
 - Picks are accepted only while the phase's ballot is open, only for matches
   that kick off at or after the ballot lock, and only until the player submits.
-- Other players' picks and trophy picks are readable only once the phase is locked.
+- Other players' picks (matches, winner, top scorer) are readable only once that
+  ballot is locked, and only for players who submitted it.
 - A submission is final (no update/delete policy).
 - Signup requires the invite code and a unique username (3–20 chars; letters
   incl. accents, digits, `. _ -`; "Márk" and "mark" count as the same name).

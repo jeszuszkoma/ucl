@@ -130,17 +130,20 @@ function revealed(m) {
 function ballotMatches(phase) {
   return state.matches.filter(m => m.phase === phase && inBallot(m));
 }
-// Progress towards SUBMIT. The league ballot also needs the two trophy picks
-// (they share its lock, and SUBMIT freezes them too).
+const TROPHY_PHASES = ['champion', 'scorer'];
+const isTrophyPhase = phase => TROPHY_PHASES.includes(phase);
+
+// Progress towards SUBMIT: the one pick of a trophy ballot, else every match.
 function pickedCount(phase) {
+  if (phase === 'champion') return { picked: myTrophy().champion ? 1 : 0, total: 1 };
+  if (phase === 'scorer') return { picked: myTrophy().top_scorer ? 1 : 0, total: 1 };
   const ms = ballotMatches(phase);
-  let picked = ms.filter(m => myPick(m)).length, total = ms.length;
-  if (phase === 'league' && total) {
-    const t = myTrophy();
-    total += 2;
-    picked += (t.champion ? 1 : 0) + (t.top_scorer ? 1 : 0);
-  }
-  return { picked, total };
+  return { picked: ms.filter(m => myPick(m)).length, total: ms.length };
+}
+function completeHint(phase) {
+  if (phase === 'champion') return 'Pick the winner first';
+  if (phase === 'scorer') return 'Pick the top scorer first';
+  return 'Pick every match first';
 }
 
 /* ---------- tournament specials ---------- */
@@ -178,10 +181,9 @@ function leaderboard() {
   const champ = champion();
   const tops = topScorerWinners()?.map(norm);
   for (const r of rows) {
-    if (!submitted(r.id, 'league')) continue;
     const t = state.trophy[r.id];
-    if (champ && t?.champion === champ) r.pts += CONFIG.POINTS_CHAMPION;
-    if (tops?.length && tops.includes(norm(t?.top_scorer))) r.pts += CONFIG.POINTS_TOP_SCORER;
+    if (champ && submitted(r.id, 'champion') && t?.champion === champ) r.pts += CONFIG.POINTS_CHAMPION;
+    if (tops?.length && submitted(r.id, 'scorer') && tops.includes(norm(t?.top_scorer))) r.pts += CONFIG.POINTS_TOP_SCORER;
   }
   for (const m of state.matches) {
     if (!revealed(m) || !inBallot(m)) continue;
@@ -256,7 +258,7 @@ function ballotBar(phase) {
   const st = ballotState(phase);
   const label = (b?.label ?? PHASE_LABEL[phase] ?? phase).toUpperCase();
   if (st === 'none') {
-    return phase === 'league'
+    return phase === 'league' || isTrophyPhase(phase)
       ? `<div class="ballot-bar none">🗳 ${label} BALLOT — not open yet</div>`
       : '';
   }
@@ -267,7 +269,7 @@ function ballotBar(phase) {
   if (st === 'submitted') return `<div class="ballot-bar done">✅ ${label} BALLOT SUBMITTED · ${picked}/${total} picks · locks ${lock}</div>`;
   const sending = state.submitting;
   const complete = total > 0 && picked === total && !sending;
-  const hint = phase === 'league' ? 'Pick every match + champion + top scorer first' : 'Pick every match first';
+  const hint = completeHint(phase);
   const note = online() ? ' <span class="bb-note">· draft stays on this device until SUBMIT</span>' : '';
   return `<div class="ballot-bar open">
     <div class="bb-text">🗳 ${label} BALLOT OPEN · <b>${picked}/${total}</b> picked · locks ${lock}${note}</div>
@@ -397,25 +399,25 @@ function renderKnockout() {
 }
 
 function renderTrophy() {
-  const st = ballotState('league');
-  const b = ballot('league');
-  const editable = st === 'open';
-  const locked = st === 'locked';
+  const cs = ballotState('champion'), ss = ballotState('scorer');
   const champ = champion();
   const mine = myTrophy();
-  const lockTxt = b ? (locked ? 'LOCKED' : `locks ${fmtDeadline(new Date(b.locks_at))}`) : 'ballot not open yet';
+  const noteFor = (st, what) => st === 'open'
+    ? `Tap to pick — changeable until you SUBMIT the ${what} ballot. Hidden from others until it locks.`
+    : st === 'submitted' ? 'Submitted — final. Hidden from others until the ballot locks.'
+    : st === 'locked' ? '' : 'Not open yet.';
 
   // --- champion ---
   let champBody;
-  if (!locked) {
+  if (cs !== 'locked') {
+    const editable = cs === 'open' && !state.submitting;
     champBody = `<div class="champ-grid">${Object.keys(TEAMS).sort().map(t => `
       <button class="champ-btn ${mine.champion === t ? 'mine' : ''}" data-champ="${esc(t)}" ${editable ? '' : 'disabled'}>
         ${crest(t, 'crest sm')}<span>${esc(teamShort(t))}</span>
       </button>`).join('')}</div>
-      <p class="special-note">${editable ? 'Tap to pick — changeable until you SUBMIT the league ballot.' : st === 'submitted' ? 'Submitted — final.' : 'Not editable now.'}
-      Hidden from others until the ballot locks.</p>`;
+      <p class="special-note">${noteFor(cs, 'winner')}</p>`;
   } else {
-    const rows = Object.entries(state.trophy).filter(([, s]) => s.champion)
+    const rows = Object.entries(state.trophy).filter(([id, s]) => s.champion && submitted(id, 'champion'))
       .map(([id, s]) => [state.profiles[id] ?? '?', s]).sort(([a], [b]) => a.localeCompare(b));
     champBody = rows.length
       ? `<div class="special-list">${rows.map(([p, s]) => `
@@ -423,14 +425,15 @@ function renderTrophy() {
             <span class="sp-player">${esc(p)}</span>
             <span class="sp-pick">${crest(s.champion, 'crest sm')} ${esc(s.champion)}${champ && s.champion === champ ? ' ✓' : ''}</span>
           </div>`).join('')}</div>`
-      : `<div class="empty">Nobody picked a champion.</div>`;
+      : `<div class="empty">Nobody submitted a champion.</div>`;
   }
 
   // --- top scorer ---
   const winners = topScorerWinners();
   const winnersN = winners?.map(norm) ?? [];
   let scorerBody;
-  if (!locked) {
+  if (ss !== 'locked') {
+    const editable = ss === 'open' && !state.submitting;
     const sel = mine.top_scorer;
     const inList = SCORERS.some(([n]) => n === sel);
     scorerBody = `<div class="champ-grid">${SCORERS.map(([n, t]) => `
@@ -445,10 +448,9 @@ function renderTrophy() {
         <input id="scorer-input" maxlength="40" placeholder="Player name…" autocomplete="off" value="${sel && !inList ? esc(sel) : ''}">
         <button id="scorer-set">SET</button>
       </div>` : ''}
-      <p class="special-note">${editable ? 'Tap to pick — changeable until you SUBMIT the league ballot.' : st === 'submitted' ? 'Submitted — final.' : 'Not editable now.'}
-      Hidden from others until the ballot locks.</p>`;
+      <p class="special-note">${noteFor(ss, 'gólkirály')}</p>`;
   } else {
-    const rows = Object.entries(state.trophy).filter(([, s]) => s.top_scorer)
+    const rows = Object.entries(state.trophy).filter(([id, s]) => s.top_scorer && submitted(id, 'scorer'))
       .map(([id, s]) => [state.profiles[id] ?? '?', s]).sort(([a], [b]) => a.localeCompare(b));
     scorerBody = rows.length
       ? `<div class="special-list">${rows.map(([p, s]) => `
@@ -456,20 +458,28 @@ function renderTrophy() {
             <span class="sp-player">${esc(p)}</span>
             <span class="sp-pick">⚽ ${esc(s.top_scorer)}${winnersN.includes(norm(s.top_scorer)) ? ' ✓' : ''}</span>
           </div>`).join('')}</div>`
-      : `<div class="empty">Nobody picked a gólkirály.</div>`;
+      : `<div class="empty">Nobody submitted a gólkirály.</div>`;
   }
 
+  // Each bar sticks only while its own card is on screen (sticky is bounded
+  // by the wrapper), so the two bars never pile up on top of each other.
   return `
+  <div class="ballot-group">
+  ${ballotBar('champion')}
   <section class="special-card">
     <h2 class="group-head">🏆 CHAMPIONS LEAGUE WINNER</h2>
-    <p class="special-note">${CONFIG.POINTS_CHAMPION} pts for the correct winner · ${lockTxt}</p>
+    <p class="special-note">${CONFIG.POINTS_CHAMPION} pts for the correct winner · own ballot, own SUBMIT</p>
     ${champBody}
   </section>
+  </div>
+  <div class="ballot-group">
+  ${ballotBar('scorer')}
   <section class="special-card">
     <h2 class="group-head">👑 GÓLKIRÁLY — TOP SCORER</h2>
-    <p class="special-note">${CONFIG.POINTS_TOP_SCORER} pts for the season's top scorer · ${lockTxt}</p>
+    <p class="special-note">${CONFIG.POINTS_TOP_SCORER} pts for the season's top scorer · own ballot, own SUBMIT</p>
     ${scorerBody}
   </section>
+  </div>
   ${scorerRaceCard()}`;
 }
 
@@ -506,9 +516,9 @@ function scoringLegend() {
     <div class="rule-row"><span class="rule-ico">👑</span>
       <span class="rule-lab">Gólkirály (top scorer) — Trophy tab</span>
       <span class="rule-pts">${CONFIG.POINTS_TOP_SCORER} pts</span></div>
-    <p class="special-note">One ballot per phase: pick every match, press SUBMIT before the deadline — only
-      submitted ballots count. Picks stay on this device until you submit. Everyone's picks stay
-      hidden until the lock.</p>
+    <p class="special-note">Three ballots to start: the league matches, the winner and the gólkirály — each with its
+      own SUBMIT. Knockout rounds get their own ballot later. Only submitted ballots count; picks stay
+      on this device until you submit. Everyone's picks stay hidden until the ballot locks.</p>
   </section>`;
 }
 
@@ -521,12 +531,13 @@ function renderBoard() {
   if (!anyRevealed) {
     // Nothing to score yet: show who is in and who has submitted.
     const subs = Object.keys(state.submissions);
+    const cell = (phase, uid) => subs.includes(`${phase}:${uid}`) ? '<span class="ok">✓</span>' : '<span class="dim">–</span>';
     return scoringLegend() + `<table class="board">
-      <thead><tr><th class="tl">PLAYER</th><th>LEAGUE BALLOT</th></tr></thead>
+      <thead><tr><th class="tl">PLAYER</th><th>LEAGUE</th><th>WINNER</th><th>GÓLKIRÁLY</th></tr></thead>
       <tbody>${rows.sort((a, b) => a.player.localeCompare(b.player)).map(r => `
         <tr class="${r.id === id ? 'me' : ''}">
           <td class="tl">${esc(r.player)}</td>
-          <td>${subs.includes(`league:${r.id}`) ? '<span class="ok">SUBMITTED ✓</span>' : '<span class="dim">not yet</span>'}</td>
+          <td>${cell('league', r.id)}</td><td>${cell('champion', r.id)}</td><td>${cell('scorer', r.id)}</td>
         </tr>`).join('')}
       </tbody></table>`;
   }
@@ -744,22 +755,26 @@ document.addEventListener('click', async e => {
     if (!me()) { openAuth(online() ? 'login' : 'local'); return; }
     const phase = sub.dataset.phase;
     const { picked, total } = pickedCount(phase);
-    if (picked !== total) { toast(phase === 'league' ? 'Pick every match, champion and top scorer first' : 'Pick every match first'); return; }
+    if (picked !== total) { toast(completeHint(phase)); return; }
     if (state.submitting) return;
     if (!confirm(`Submit your ${ballot(phase)?.label ?? phase} ballot?\n\nFINAL — no changes afterwards.`)) return;
     const key = `${phase}:${myId()}`;
-    // The whole ballot goes in one request: every pick of the phase (+ the
-    // trophy picks for the league). Nothing was sent before this point.
+    // The whole ballot goes in one request: every pick of a match phase, or
+    // the one pick of a trophy ballot. Nothing was sent before this point.
     const picks = {};
-    for (const m of ballotMatches(phase)) { const p = myPick(m); if (p) picks[m.num] = p; }
+    if (!isTrophyPhase(phase)) for (const m of ballotMatches(phase)) { const p = myPick(m); if (p) picks[m.num] = p; }
     const t = myTrophy();
     state.submitting = true;
     render();
     let unsure = false; // no definite answer from the server (timeout, network, 5xx)
     try {
-      await submitPhase(phase, { picks, champion: t.champion, top_scorer: t.top_scorer });
+      await submitPhase(phase, {
+        picks,
+        champion: phase === 'champion' ? t.champion : null,
+        top_scorer: phase === 'scorer' ? t.top_scorer : null,
+      });
       state.submissions[key] = new Date().toISOString();
-      clearDraft(Object.keys(picks), { trophy: phase === 'league' });
+      clearDraft(Object.keys(picks), { champion: phase === 'champion', scorer: phase === 'scorer' });
       toast('Ballot submitted ✅', 'ok');
     } catch (err) {
       console.error(err);
@@ -914,13 +929,15 @@ function applyDrafts() {
     if (st === 'submitted') { dead.push(num); continue; }
     if (st === 'open') state.picks[`${num}:${uid}`] = pick;
   }
-  const hasTrophy = Boolean(d.trophy.champion || d.trophy.top_scorer);
-  const league = ballotState('league');
-  if (league === 'open' && hasTrophy) {
-    state.trophy[uid] = { champion: null, top_scorer: null, ...(state.trophy[uid] ?? {}), ...d.trophy };
-  }
-  const deadTrophy = hasTrophy && league === 'submitted';
-  if (dead.length || deadTrophy) clearDraft(dead, { trophy: deadTrophy });
+  const cs = ballotState('champion'), ss = ballotState('scorer');
+  const cur = state.trophy[uid] ?? {};
+  const t = { champion: cur.champion ?? null, top_scorer: cur.top_scorer ?? null };
+  if (cs === 'open' && d.trophy.champion) t.champion = d.trophy.champion;
+  if (ss === 'open' && d.trophy.top_scorer) t.top_scorer = d.trophy.top_scorer;
+  if (t.champion || t.top_scorer) state.trophy[uid] = t;
+  const deadChamp = Boolean(d.trophy.champion) && cs === 'submitted';
+  const deadScorer = Boolean(d.trophy.top_scorer) && ss === 'submitted';
+  if (dead.length || deadChamp || deadScorer) clearDraft(dead, { champion: deadChamp, scorer: deadScorer });
 }
 
 /* ---------- boot ---------- */

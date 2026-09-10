@@ -86,12 +86,13 @@ export function loadDraft() {
 function saveDraft(d) { lsSet(draftKey(currentUser()), d); }
 
 // Forget draft rows that a submit turned into server rows.
-export function clearDraft(nums, { trophy = false } = {}) {
+export function clearDraft(nums, { champion = false, scorer = false } = {}) {
   const me = currentUser();
   if (!me || !online()) return;
   const d = loadDraft();
   for (const n of nums) delete d.picks[n];
-  if (trophy) d.trophy = {};
+  if (champion) delete d.trophy.champion;
+  if (scorer) delete d.trophy.top_scorer;
   saveDraft(d);
 }
 
@@ -100,7 +101,7 @@ export function clearDraft(nums, { trophy = false } = {}) {
 //   profiles:    { user_id: username }
 //   picks:       { "<num>:<user_id>": pick }      (server rows only - drafts are layered on by the app)
 //   submissions: { "<phase>:<user_id>": submitted_at }
-//   trophy:      { user_id: { champion, top_scorer } }
+//   trophy:      { user_id: { champion, top_scorer } }   (from champion_picks + scorer_picks)
 // }
 export async function fetchState() {
   const me = currentUser();
@@ -117,12 +118,13 @@ export async function fetchState() {
       picks, submissions, trophy,
     };
   }
-  const [ballotRows, profileRows, pickRows, subRows, trophyRows] = await Promise.all([
+  const [ballotRows, profileRows, pickRows, subRows, champRows, scorerRows] = await Promise.all([
     fetchAll('ballots?select=phase,label,opens_at,locks_at'),
     fetchAll('profiles?select=user_id,username&order=username.asc'),
     fetchAll('picks?select=user_id,match_num,pick&order=match_num.asc,user_id.asc'),
     fetchAll('submissions?select=user_id,phase,submitted_at'),
-    fetchAll('trophy_picks?select=user_id,champion,top_scorer'),
+    fetchAll('champion_picks?select=user_id,champion'),
+    fetchAll('scorer_picks?select=user_id,top_scorer'),
   ]);
   const ballots = {};
   for (const b of ballotRows) ballots[b.phase] = { label: b.label, opens_at: b.opens_at, locks_at: b.locks_at };
@@ -133,7 +135,8 @@ export async function fetchState() {
   const submissions = {};
   for (const r of subRows) submissions[`${r.phase}:${r.user_id}`] = r.submitted_at;
   const trophy = {};
-  for (const r of trophyRows) trophy[r.user_id] = { champion: r.champion, top_scorer: r.top_scorer };
+  for (const r of champRows) trophy[r.user_id] = { champion: r.champion, top_scorer: null };
+  for (const r of scorerRows) trophy[r.user_id] = { ...(trophy[r.user_id] ?? { champion: null }), top_scorer: r.top_scorer };
   return { ballots, profiles, picks, submissions, trophy };
 }
 
@@ -168,10 +171,10 @@ export async function saveTrophy(patch) {
   saveDraft(d);
 }
 
-// Ship the whole ballot and freeze it. Irreversible. One request: the server
-// writes every pick, the trophy picks (league) and the submission row in a
-// single transaction, or nothing at all.
-//   picks: { "<num>": pick } for every match of the phase
+// Ship one ballot and freeze it. Irreversible. One request: the server writes
+// the picks and the submission row in a single transaction, or nothing.
+//   match phases: picks = { "<num>": pick } for every match of the phase
+//   'champion': champion        'scorer': top_scorer
 export async function submitPhase(phase, { picks, champion = null, top_scorer = null }) {
   const me = currentUser();
   if (!me) throw new Error('not logged in');

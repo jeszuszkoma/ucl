@@ -27,5 +27,7 @@ export const CONFIG = {
   // Local-mode ballots (no Supabase). Mirrors what supabase/matches.sql seeds.
   LOCAL_BALLOTS: {
     league: { label: 'League phase', opens_at: '2026-09-01T00:00:00Z', locks_at: '2026-10-13T16:45:00Z' },
+    champion: { label: 'Champions League winner', opens_at: '2026-09-01T00:00:00Z', locks_at: '2026-10-13T16:45:00Z' },
+    scorer: { label: 'Gólkirály (top scorer)', opens_at: '2026-09-01T00:00:00Z', locks_at: '2026-10-13T16:45:00Z' },
   },
 };
