@@ -112,6 +112,7 @@ nav { display: flex; gap: 6px; margin-top: 10px; }
 .ballot-bar.done { color: var(--hit); border-color: rgba(24, 224, 122, 0.4); }
 .ballot-bar.locked { color: var(--amber); border-color: rgba(255, 179, 0, 0.35); }
 .bb-text { flex: 1; min-width: 0; }
+.bb-note { display: block; color: var(--text-dim); font-weight: 400; font-size: 0.68rem; letter-spacing: 0.06em; }
 .submit-ballot {
   padding: 8px 18px; font-family: 'Orbitron', sans-serif; font-weight: 700;
   font-size: 0.72rem; letter-spacing: 0.16em; color: #021016;

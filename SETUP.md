@@ -90,6 +90,14 @@ server, e.g. `npx http-server . -p 8087 -c-1`, then open
 
 ## Operating the game
 
+- **Schema changes:** `supabase/schema.sql` is safe to re-run (everything is
+  create-or-replace / if-not-exists). Apply it *before* pushing JavaScript that
+  depends on it - e.g. SUBMIT calls the `submit_ballot` function, and a client
+  deployed ahead of the SQL would fail every submit.
+- **Only submitted ballots count.** Picks stay in the player's browser until
+  SUBMIT; the server reveals and the board scores only rows that belong to a
+  submitted ballot. A player who never submits simply has no ballot.
+
 - **Fixtures / results / standings** come live from ESPN; nothing to do.
 - **Refresh the bundled schedule** (postponements, or when knockout fixtures
   appear):

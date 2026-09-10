@@ -207,10 +207,19 @@ $$;
 
 drop policy if exists "read submissions" on public.submissions;
 create policy "read submissions" on public.submissions for select to authenticated using (true);
-drop policy if exists "submit own" on public.submissions;
-create policy "submit own" on public.submissions for insert to authenticated
-  with check (user_id = auth.uid() and public.phase_open(phase));
+-- "submit own" (insert) is declared further down, after picks and
+-- trophy_picks exist: it checks that the ballot is complete.
 -- No update/delete: a submission is final.
+
+-- Has this player submitted the ballot the match belongs to? Only submitted
+-- ballots are ever revealed or scored; rows without a submission (never
+-- pressed SUBMIT) stay invisible to everyone but their owner.
+create or replace function public.pick_submitted(p_user uuid, p_num int) returns boolean
+language sql stable set search_path = public as $$
+  select exists (select 1 from public.submissions s
+                   join public.matches m on m.phase = s.phase
+                  where s.user_id = p_user and m.num = p_num)
+$$;
 
 -- ---------------------------------------------------------------- picks
 create table if not exists public.picks (
@@ -227,7 +236,7 @@ create policy "read own picks" on public.picks for select to authenticated
   using (user_id = auth.uid());
 drop policy if exists "read revealed picks" on public.picks;
 create policy "read revealed picks" on public.picks for select to authenticated
-  using (public.match_locked(match_num));
+  using (public.match_locked(match_num) and public.pick_submitted(user_id, match_num));
 drop policy if exists "insert own pick" on public.picks;
 create policy "insert own pick" on public.picks for insert to authenticated
   with check (user_id = auth.uid() and public.can_pick(match_num));
@@ -259,7 +268,8 @@ create policy "read own trophy" on public.trophy_picks for select to authenticat
   using (user_id = auth.uid());
 drop policy if exists "read revealed trophy" on public.trophy_picks;
 create policy "read revealed trophy" on public.trophy_picks for select to authenticated
-  using (public.phase_locked('league'));
+  using (public.phase_locked('league')
+         and exists (select 1 from public.submissions s where s.user_id = trophy_picks.user_id and s.phase = 'league'));
 drop policy if exists "insert own trophy" on public.trophy_picks;
 create policy "insert own trophy" on public.trophy_picks for insert to authenticated
   with check (user_id = auth.uid() and public.can_edit_phase('league'));
@@ -270,6 +280,103 @@ create policy "update own trophy" on public.trophy_picks for update to authentic
 drop trigger if exists trophy_touch on public.trophy_picks;
 create trigger trophy_touch before update on public.trophy_picks
   for each row execute function public.touch_updated_at();
+
+-- ---------------------------------------------------------------- submit own
+-- A submission row is what makes a ballot count. It can only be inserted
+-- while the phase is open and once the caller's ballot is complete: a pick
+-- for every match of the phase (kickoff >= lock) and, for the league, both
+-- trophy picks. submit_ballot() below writes the picks first, in the same
+-- transaction, so it passes; a bare POST to /rest/v1/submissions cannot
+-- mark a half-filled ballot as submitted.
+create or replace function public.ballot_complete(p_phase text) returns boolean
+language sql stable set search_path = public as $$
+  select exists (select 1 from public.matches m join public.ballots b on b.phase = m.phase
+                  where m.phase = p_phase and m.kickoff >= b.locks_at)
+     and not exists (select 1 from public.matches m join public.ballots b on b.phase = m.phase
+                      where m.phase = p_phase and m.kickoff >= b.locks_at
+                        and not exists (select 1 from public.picks p
+                                         where p.user_id = auth.uid() and p.match_num = m.num))
+     and (p_phase <> 'league'
+          or exists (select 1 from public.trophy_picks t
+                      where t.user_id = auth.uid()
+                        and nullif(trim(t.champion), '') is not null
+                        and nullif(trim(t.top_scorer), '') is not null))
+$$;
+drop policy if exists "submit own" on public.submissions;
+create policy "submit own" on public.submissions for insert to authenticated
+  with check (user_id = auth.uid() and public.phase_open(phase) and public.ballot_complete(phase));
+
+-- ---------------------------------------------------------------- submit_ballot
+-- The whole ballot arrives in one call. Picks live on the player's device
+-- until SUBMIT; then every pick, the trophy picks (league) and the submission
+-- row are written in a single transaction and frozen. Runs as the caller
+-- (security invoker), so the row policies above still decide what may be
+-- written; the completeness check here just gives a clear error before the
+-- "submit own" policy would refuse the submission row.
+-- p_picks: [{"num": 19, "pick": "1"}, ...] - every match of the ballot.
+create or replace function public.submit_ballot(
+  p_phase text, p_picks jsonb, p_champion text default null, p_top_scorer text default null)
+returns void
+language plpgsql
+set search_path = public
+as $$
+declare
+  v_uid uuid := auth.uid();
+  v_total int;
+  v_given int;
+begin
+  if v_uid is null then
+    raise exception 'not logged in' using errcode = '42501';
+  end if;
+  if not public.can_edit_phase(p_phase) then
+    raise exception 'ballot closed or already submitted' using errcode = '42501';
+  end if;
+  if p_picks is null or jsonb_typeof(p_picks) <> 'array' then
+    raise exception 'picks must be a JSON array' using errcode = '22023';
+  end if;
+
+  -- Every match of the ballot exactly once, each with a legal pick. Picks for
+  -- matches outside the ballot (already played, other phase) are ignored.
+  select count(*) into v_total
+    from public.matches m join public.ballots b on b.phase = m.phase
+   where m.phase = p_phase and m.kickoff >= b.locks_at;
+  select count(distinct m.num) into v_given
+    from jsonb_array_elements(p_picks) e
+    join public.matches m on m.num = (e->>'num')::int
+    join public.ballots b on b.phase = m.phase
+   where m.phase = p_phase and m.kickoff >= b.locks_at
+     and e->>'pick' in ('1', 'X', '2');
+  if v_total = 0 or v_given <> v_total then
+    raise exception 'incomplete ballot: % of % picks', v_given, v_total using errcode = '23514';
+  end if;
+  if p_phase = 'league'
+     and (nullif(trim(p_champion), '') is null or nullif(trim(p_top_scorer), '') is null) then
+    raise exception 'champion and top scorer required' using errcode = '23514';
+  end if;
+
+  -- last occurrence wins if a match appears twice
+  insert into public.picks (user_id, match_num, pick)
+  select v_uid, p.num, p.pick from (
+    select distinct on (m.num) m.num, e.val->>'pick' as pick
+      from jsonb_array_elements(p_picks) with ordinality as e(val, ord)
+      join public.matches m on m.num = (e.val->>'num')::int
+      join public.ballots b on b.phase = m.phase
+     where m.phase = p_phase and m.kickoff >= b.locks_at
+       and e.val->>'pick' in ('1', 'X', '2')
+     order by m.num, e.ord desc) p
+  on conflict (user_id, match_num) do update set pick = excluded.pick;
+
+  if p_phase = 'league' then
+    insert into public.trophy_picks (user_id, champion, top_scorer)
+    values (v_uid, trim(p_champion), trim(p_top_scorer))
+    on conflict (user_id) do update
+      set champion = excluded.champion, top_scorer = excluded.top_scorer;
+  end if;
+
+  insert into public.submissions (user_id, phase) values (v_uid, p_phase);
+end $$;
+revoke all on function public.submit_ballot(text, jsonb, text, text) from public, anon;
+grant execute on function public.submit_ballot(text, jsonb, text, text) to authenticated;
 
 -- ---------------------------------------------------------------- admin notes
 -- Read / change the invite code:

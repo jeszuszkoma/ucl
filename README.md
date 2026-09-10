@@ -14,8 +14,10 @@ points when you're right, top the board.
   the email, log in with username (or email) + password. Username is what the
   board shows. Emails stay private.
 - **League ballot:** all 126 remaining league-phase matches (Matchday 2–8; MD1
-  was played before launch). Pick every match, press **SUBMIT** — final. Anyone
-  who never submits is locked automatically at the deadline
+  was played before launch). Pick every match, press **SUBMIT** — final. Picks
+  stay in your browser until you submit (one request per ballot, not one per
+  tap), so finish on the device you started on. A ballot that is never
+  submitted counts for nothing after the deadline
   (**Oct 13, 2026 18:45 CEST**, Matchday 2 kickoff). Everyone's picks are hidden
   until then, then revealed on the cards.
 - **Knockout ballots:** one per round (play-off, R16, QF, SF, final), opening

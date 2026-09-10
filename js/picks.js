@@ -2,13 +2,21 @@ import { CONFIG } from './config.js';
 import { online, headers, token, currentUser } from './auth.js';
 
 // Ballot state: picks, submissions, trophy picks, ballots, player names.
+//
+// Picks are NOT sent to the server as they are tapped. They stay in this
+// browser (localStorage, per player) until SUBMIT ships the whole ballot in
+// one call (`submit_ballot` RPC): one request per player per phase instead
+// of one per tap. Trade-off: a draft exists only on the device it was made
+// on, and a ballot that is never submitted counts for nothing.
+//
 // Online: Supabase PostgREST as the logged-in user (RLS decides what is
 // visible / writable). Local mode: everything in localStorage.
 
 const LS = {
-  picks: 'ucl.local.picks',        // { "<num>": "1"|"X"|"2" }
-  subs: 'ucl.local.submissions',   // { "<phase>": iso }
-  trophy: 'ucl.local.trophy',      // { champion, top_scorer }
+  picks: 'ucl.local.picks',        // local mode: { "<num>": "1"|"X"|"2" }
+  subs: 'ucl.local.submissions',   // local mode: { "<phase>": iso }
+  trophy: 'ucl.local.trophy',      // local mode: { champion, top_scorer }
+  draft: 'ucl.draft.',             // online: + user id -> { picks, trophy }
 };
 const ls = (k, d) => { try { return JSON.parse(localStorage.getItem(k) || 'null') ?? d; } catch { return d; } };
 const lsSet = (k, v) => localStorage.setItem(k, JSON.stringify(v));
@@ -17,8 +25,8 @@ const base = () => CONFIG.SUPABASE_URL.replace(/\/$/, '');
 
 // PostgREST rejects an expired JWT with 401 (server clock, not ours): refresh
 // once and retry, so a slow device clock never reads as "ballot closed".
-// Every request gets a bounded lifetime so a hung write can't keep SUBMIT
-// disabled ("saving…") for minutes; a fresh signal is created per attempt.
+// Every request gets a bounded lifetime so a hung submit can't keep the
+// button on "sending…" for minutes; a fresh signal is created per attempt.
 const TIMEOUT_MS = 15_000;
 async function restFetch(url, init, retry = true) {
   const res = await fetch(url, {
@@ -48,27 +56,49 @@ async function fetchAll(path) {
   }
 }
 
-async function write(path, body, { onConflict } = {}) {
-  const url = `${base()}/rest/v1/${path}${onConflict ? `?on_conflict=${onConflict}` : ''}`;
-  const res = await restFetch(url, {
+async function rpc(name, body) {
+  const res = await restFetch(`${base()}/rest/v1/rpc/${name}`, {
     method: 'POST',
-    headers: { Prefer: onConflict ? 'resolution=merge-duplicates,return=minimal' : 'return=minimal' },
     body: JSON.stringify(body),
   });
-  if (!res.ok) {
-    const txt = await res.text();
-    const err = new Error(`${path} ${res.status}: ${txt}`);
-    err.status = res.status;
-    // 42501 = RLS refused (ballot closed / already submitted / not in ballot)
-    err.locked = res.status === 403 || /42501|row-level security/.test(txt);
-    throw err;
-  }
+  if (res.ok) return;
+  const txt = await res.text();
+  const err = new Error(`${name} ${res.status}: ${txt}`);
+  err.status = res.status;
+  // 42501 = refused by RLS or the function (ballot closed / already submitted)
+  err.locked = res.status === 403 || /42501|row-level security/.test(txt);
+  // 23514 = the server disagrees that the ballot is complete
+  err.incomplete = /23514/.test(txt);
+  throw err;
+}
+
+// ---------------------------------------------------------------- drafts
+// { picks: { "<num>": pick }, trophy: { champion, top_scorer } } of the
+// logged-in player on this device. Empty in local mode (its picks are the
+// "server" there) and when logged out.
+const draftKey = me => `${LS.draft}${me.id}`;
+export function loadDraft() {
+  const me = currentUser();
+  if (!me || !online()) return { picks: {}, trophy: {} };
+  const d = ls(draftKey(me), {});
+  return { picks: d.picks ?? {}, trophy: d.trophy ?? {} };
+}
+function saveDraft(d) { lsSet(draftKey(currentUser()), d); }
+
+// Forget draft rows that a submit turned into server rows.
+export function clearDraft(nums, { trophy = false } = {}) {
+  const me = currentUser();
+  if (!me || !online()) return;
+  const d = loadDraft();
+  for (const n of nums) delete d.picks[n];
+  if (trophy) d.trophy = {};
+  saveDraft(d);
 }
 
 // -> {
 //   ballots:     { phase: { label, opens_at, locks_at } }
 //   profiles:    { user_id: username }
-//   picks:       { "<num>:<user_id>": pick }
+//   picks:       { "<num>:<user_id>": pick }      (server rows only - drafts are layered on by the app)
 //   submissions: { "<phase>:<user_id>": submitted_at }
 //   trophy:      { user_id: { champion, top_scorer } }
 // }
@@ -77,15 +107,13 @@ export async function fetchState() {
   if (!me) return { ballots: await fetchBallots(), profiles: {}, picks: {}, submissions: {}, trophy: {} };
   if (!online()) {
     const picks = {}, submissions = {}, trophy = {};
-    if (me) {
-      for (const [num, pick] of Object.entries(ls(LS.picks, {}))) picks[`${num}:${me.id}`] = pick;
-      for (const [phase, at] of Object.entries(ls(LS.subs, {}))) submissions[`${phase}:${me.id}`] = at;
-      const t = ls(LS.trophy, null);
-      if (t) trophy[me.id] = t;
-    }
+    for (const [num, pick] of Object.entries(ls(LS.picks, {}))) picks[`${num}:${me.id}`] = pick;
+    for (const [phase, at] of Object.entries(ls(LS.subs, {}))) submissions[`${phase}:${me.id}`] = at;
+    const t = ls(LS.trophy, null);
+    if (t) trophy[me.id] = t;
     return {
       ballots: CONFIG.LOCAL_BALLOTS,
-      profiles: me ? { [me.id]: me.username } : {},
+      profiles: { [me.id]: me.username },
       picks, submissions, trophy,
     };
   }
@@ -109,6 +137,7 @@ export async function fetchState() {
   return { ballots, profiles, picks, submissions, trophy };
 }
 
+// Draft pick - this device only, no request.
 export async function savePick(num, pick) {
   const me = currentUser();
   if (!me) throw new Error('not logged in');
@@ -118,25 +147,12 @@ export async function savePick(num, pick) {
     lsSet(LS.picks, map);
     return;
   }
-  await write('picks', { user_id: me.id, match_num: num, pick }, { onConflict: 'user_id,match_num' });
+  const d = loadDraft();
+  d.picks[num] = pick;
+  saveDraft(d);
 }
 
-// Freeze the caller's ballot for a phase. Irreversible.
-export async function submitPhase(phase) {
-  const me = currentUser();
-  if (!me) throw new Error('not logged in');
-  if (!online()) {
-    const map = ls(LS.subs, {});
-    map[phase] = new Date().toISOString();
-    lsSet(LS.subs, map);
-    return;
-  }
-  await write('submissions', { user_id: me.id, phase });
-}
-
-// Champion + top scorer. Send ONLY the changed column: PostgREST's
-// merge-duplicates upsert updates just the payload columns, so a stale local
-// copy of the other pick can never null it.
+// Draft champion / top scorer - this device only, no request.
 export async function saveTrophy(patch) {
   const me = currentUser();
   if (!me) throw new Error('not logged in');
@@ -147,7 +163,30 @@ export async function saveTrophy(patch) {
     lsSet(LS.trophy, { champion: null, top_scorer: null, ...ls(LS.trophy, {}), ...cols });
     return;
   }
-  await write('trophy_picks', { user_id: me.id, ...cols }, { onConflict: 'user_id' });
+  const d = loadDraft();
+  d.trophy = { ...d.trophy, ...cols };
+  saveDraft(d);
+}
+
+// Ship the whole ballot and freeze it. Irreversible. One request: the server
+// writes every pick, the trophy picks (league) and the submission row in a
+// single transaction, or nothing at all.
+//   picks: { "<num>": pick } for every match of the phase
+export async function submitPhase(phase, { picks, champion = null, top_scorer = null }) {
+  const me = currentUser();
+  if (!me) throw new Error('not logged in');
+  if (!online()) {
+    const map = ls(LS.subs, {});
+    map[phase] = new Date().toISOString();
+    lsSet(LS.subs, map);
+    return;
+  }
+  await rpc('submit_ballot', {
+    p_phase: phase,
+    p_picks: Object.entries(picks).map(([num, pick]) => ({ num: Number(num), pick })),
+    p_champion: champion,
+    p_top_scorer: top_scorer,
+  });
 }
 
 // Ballot deadlines are public (anon-readable): lets a logged-out visitor see

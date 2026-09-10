@@ -8,13 +8,14 @@ import {
   online, currentUser, signup, login, logout, recover, resend, updatePassword, handleAuthHash,
   loadProfile, setLocalName, describe, AuthError,
 } from './auth.js';
-import { fetchState, fetchBallots, savePick, submitPhase, saveTrophy } from './picks.js';
+import { fetchState, fetchBallots, savePick, submitPhase, saveTrophy, loadDraft, clearDraft } from './picks.js';
 
 const $ = sel => document.querySelector(sel);
 
-// Bumped before every optimistic write; a background state snapshot that
-// started before the bump must not clobber the player's own fresh rows.
-let writeSeq = 0;
+// Every state load takes a number; a snapshot that finishes after a newer
+// load started is stale (e.g. it began before a SUBMIT committed) and is dropped.
+let loadSeq = 0;
+let draftHintShown = false;
 
 const state = {
   matches: [],
@@ -32,7 +33,7 @@ const state = {
   stateLoaded: false,
   authMode: null,   // null | 'login' | 'register' | 'forgot' | 'resend' | 'reset' | 'sent' | 'local'
   authBusy: false,
-  pendingWrites: 0, // picks / trophy saves in flight (SUBMIT waits for them)
+  submitting: false, // SUBMIT request in flight
 };
 
 // Gólkirály shortlist. OTHER… opens free text for anyone else.
@@ -82,11 +83,19 @@ function myPick(m) {
   const id = myId();
   return id ? state.picks[`${m.num}:${id}`] ?? null : null;
 }
+// Did this player submit the ballot the match belongs to? Only submitted
+// ballots count - rows without a submission (never pressed SUBMIT) are ignored.
+function submitted(userId, phase) {
+  return Boolean(state.submissions[`${phase}:${userId}`]);
+}
 function picksFor(m) {
   const out = { 1: [], X: [], 2: [] };
   const prefix = `${m.num}:`;
   for (const [key, pick] of Object.entries(state.picks)) {
-    if (key.startsWith(prefix)) out[pick]?.push(state.profiles[key.slice(prefix.length)] ?? '?');
+    if (!key.startsWith(prefix)) continue;
+    const uid = key.slice(prefix.length);
+    if (!submitted(uid, m.phase)) continue;
+    out[pick]?.push(state.profiles[uid] ?? '?');
   }
   for (const k of Object.keys(out)) out[k].sort((a, b) => a.localeCompare(b));
   return out;
@@ -169,6 +178,7 @@ function leaderboard() {
   const champ = champion();
   const tops = topScorerWinners()?.map(norm);
   for (const r of rows) {
+    if (!submitted(r.id, 'league')) continue;
     const t = state.trophy[r.id];
     if (champ && t?.champion === champ) r.pts += CONFIG.POINTS_CHAMPION;
     if (tops?.length && tops.includes(norm(t?.top_scorer))) r.pts += CONFIG.POINTS_TOP_SCORER;
@@ -178,6 +188,7 @@ function leaderboard() {
     const res = outcome(m);
     if (!res || m._live) continue;
     for (const r of rows) {
+      if (!submitted(r.id, m.phase)) continue;
       const pick = state.picks[`${m.num}:${r.id}`];
       if (!pick) continue;
       r.played++;
@@ -254,13 +265,14 @@ function ballotBar(phase) {
   if (st === 'locked') return `<div class="ballot-bar locked">🔒 ${label} BALLOT LOCKED — everyone's picks revealed</div>`;
   const { picked, total } = pickedCount(phase);
   if (st === 'submitted') return `<div class="ballot-bar done">✅ ${label} BALLOT SUBMITTED · ${picked}/${total} picks · locks ${lock}</div>`;
-  const saving = state.pendingWrites > 0;
-  const complete = total > 0 && picked === total && !saving;
+  const sending = state.submitting;
+  const complete = total > 0 && picked === total && !sending;
   const hint = phase === 'league' ? 'Pick every match + champion + top scorer first' : 'Pick every match first';
+  const note = online() ? ' <span class="bb-note">· draft stays on this device until SUBMIT</span>' : '';
   return `<div class="ballot-bar open">
-    <div class="bb-text">🗳 ${label} BALLOT OPEN · <b>${picked}/${total}</b> picked · locks ${lock}</div>
+    <div class="bb-text">🗳 ${label} BALLOT OPEN · <b>${picked}/${total}</b> picked · locks ${lock}${note}</div>
     <button class="submit-ballot" data-phase="${esc(phase)}" ${complete ? '' : 'disabled'}
-      title="${complete ? 'Submit — final, no changes after' : saving ? 'Saving picks…' : hint}">SUBMIT</button>
+      title="${complete ? 'Submit — final, no changes after' : sending ? 'Sending…' : hint}">${sending ? 'SENDING…' : 'SUBMIT'}</button>
   </div>`;
 }
 
@@ -494,8 +506,9 @@ function scoringLegend() {
     <div class="rule-row"><span class="rule-ico">👑</span>
       <span class="rule-lab">Gólkirály (top scorer) — Trophy tab</span>
       <span class="rule-pts">${CONFIG.POINTS_TOP_SCORER} pts</span></div>
-    <p class="special-note">One ballot per phase: pick every match, press SUBMIT. Unsubmitted ballots lock
-      automatically at the deadline. Everyone's picks stay hidden until then.</p>
+    <p class="special-note">One ballot per phase: pick every match, press SUBMIT before the deadline — only
+      submitted ballots count. Picks stay on this device until you submit. Everyone's picks stay
+      hidden until the lock.</p>
   </section>`;
 }
 
@@ -513,7 +526,7 @@ function renderBoard() {
       <tbody>${rows.sort((a, b) => a.player.localeCompare(b.player)).map(r => `
         <tr class="${r.id === id ? 'me' : ''}">
           <td class="tl">${esc(r.player)}</td>
-          <td>${subs.includes(`league:${r.id}`) ? '<span class="ok">SUBMITTED ✓</span>' : '<span class="dim">draft</span>'}</td>
+          <td>${subs.includes(`league:${r.id}`) ? '<span class="ok">SUBMITTED ✓</span>' : '<span class="dim">not yet</span>'}</td>
         </tr>`).join('')}
       </tbody></table>`;
   }
@@ -630,7 +643,6 @@ async function authAction(fn) {
 const val = id => $(`#${id}`)?.value ?? '';
 
 async function afterLogin() {
-  writeSeq++; // anything fetched for the previous identity is stale
   closeAuth();
   render();
   const first = !state.stateLoaded;
@@ -656,7 +668,7 @@ document.addEventListener('click', async e => {
   if (e.target.closest('#player-chip')) {
     if (!me()) { openAuth(online() ? 'login' : 'local'); return; }
     if (confirm(`Log out ${me().username}?`)) {
-      writeSeq++;
+      loadSeq++; // drop any snapshot of the old identity still in flight
       await logout();
       if (!online()) localStorage.removeItem('ucl.localName');
       state.picks = {}; state.submissions = {}; state.trophy = {};
@@ -733,27 +745,38 @@ document.addEventListener('click', async e => {
     const phase = sub.dataset.phase;
     const { picked, total } = pickedCount(phase);
     if (picked !== total) { toast(phase === 'league' ? 'Pick every match, champion and top scorer first' : 'Pick every match first'); return; }
-    if (state.pendingWrites > 0) { toast('Still saving a pick — try again in a second'); return; }
+    if (state.submitting) return;
     if (!confirm(`Submit your ${ballot(phase)?.label ?? phase} ballot?\n\nFINAL — no changes afterwards.`)) return;
     const key = `${phase}:${myId()}`;
-    writeSeq++;
-    state.pendingWrites++;
-    state.submissions[key] = new Date().toISOString(); // optimistic
+    // The whole ballot goes in one request: every pick of the phase (+ the
+    // trophy picks for the league). Nothing was sent before this point.
+    const picks = {};
+    for (const m of ballotMatches(phase)) { const p = myPick(m); if (p) picks[m.num] = p; }
+    const t = myTrophy();
+    state.submitting = true;
     render();
+    let unsure = false; // no definite answer from the server (timeout, network, 5xx)
     try {
-      await submitPhase(phase);
+      await submitPhase(phase, { picks, champion: t.champion, top_scorer: t.top_scorer });
+      state.submissions[key] = new Date().toISOString();
+      clearDraft(Object.keys(picks), { trophy: phase === 'league' });
       toast('Ballot submitted ✅', 'ok');
     } catch (err) {
       console.error(err);
-      delete state.submissions[key];
-      if (err instanceof AuthError && (err.code === 'session_expired' || err.code === 'no_session')) { render(); openAuth('login'); return; }
-      toast(err.locked ? 'Ballot is closed' : 'Submit failed — check connection');
+      if (loggedOut(err)) { state.submitting = false; render(); openAuth('login'); return; }
+      if (err.locked) toast('Ballot is closed or already submitted');
+      else if (err.incomplete) toast('Server says the ballot is incomplete — reload and check your picks');
+      else if (err.status >= 400 && err.status < 500) toast('Submit refused — reload and try again');
+      else { unsure = true; toast('No answer from the server — checking…'); }
     } finally {
-      state.pendingWrites--;
-      writeSeq++; // snapshots that started during the write are stale
+      state.submitting = false;
     }
     await loadState().catch(() => {});
     render();
+    if (unsure) {
+      if (state.submissions[key]) toast('Ballot submitted ✅', 'ok');
+      else toast('Submit did not go through — check connection and try again');
+    }
     return;
   }
 
@@ -792,50 +815,35 @@ document.addEventListener('click', async e => {
     const pick = btn.dataset.vote;
     const key = `${num}:${myId()}`;
     const prev = state.picks[key];
-    writeSeq++;
-    state.pendingWrites++;
-    state.picks[key] = pick; // optimistic
-    render();
+    state.picks[key] = pick;
     try {
-      // One upsert at a time per match: a double-tap must end with the last tap.
-      const run = () => savePick(num, pick);
-      const p = (saving.get(key) ?? Promise.resolve()).then(run, run);
-      saving.set(key, p);
-      await p;
+      await savePick(num, pick); // this device only - nothing is sent until SUBMIT
+      if (online() && !draftHintShown) {
+        draftHintShown = true;
+        toast('Picks stay on this device until you press SUBMIT', 'ok');
+      }
     } catch (err) {
       console.error(err);
-      if (state.picks[key] === pick) { if (prev) state.picks[key] = prev; else delete state.picks[key]; }
-      if (err instanceof AuthError && (err.code === 'session_expired' || err.code === 'no_session')) { openAuth('login'); return; }
-      toast(err.locked ? 'Ballot is closed' : 'Pick failed — check connection');
-      if (err.locked) loadState().then(render).catch(() => {});
-    } finally {
-      state.pendingWrites--;
-      writeSeq++; // snapshots that started during the write are stale
-      render();
+      if (prev) state.picks[key] = prev; else delete state.picks[key];
+      toast('Could not store the pick on this device — storage blocked or full');
     }
+    render();
   }
 });
-const saving = new Map(); // "num:user" -> last save promise
 
 async function setTrophy(patch) {
   if (!me()) { openAuth(online() ? 'login' : 'local'); return; }
   const id = myId();
   const prev = state.trophy[id] ?? { champion: null, top_scorer: null };
-  writeSeq++;
-  state.pendingWrites++;
-  state.trophy[id] = { ...prev, ...patch }; // optimistic
+  state.trophy[id] = { ...prev, ...patch };
   render();
   try {
-    await saveTrophy(patch); // only the changed column goes to the server
-    toast(patch.champion ? 'Champion pick saved 🏆' : 'Gólkirály pick saved 👑', 'ok');
+    await saveTrophy(patch); // this device only - nothing is sent until SUBMIT
+    toast(patch.champion ? 'Champion picked 🏆' : 'Gólkirály picked 👑', 'ok');
   } catch (err) {
     console.error(err);
     state.trophy[id] = prev;
-    if (err instanceof AuthError && (err.code === 'session_expired' || err.code === 'no_session')) { openAuth('login'); return; }
-    toast(err.locked ? 'Ballot is closed' : 'Save failed — check connection');
-  } finally {
-    state.pendingWrites--;
-    writeSeq++; // snapshots that started during the write are stale
+    toast('Could not store the pick on this device');
     render();
   }
 }
@@ -870,29 +878,16 @@ async function loadState() {
     try { state.ballots = await fetchBallots(); } catch (e) { console.warn('ballots', e); }
     return;
   }
-  const seq = writeSeq, uid = myId();
+  const seq = ++loadSeq, uid = myId();
   try {
     const s = await fetchState();
-    if (myId() !== uid) return; // logged out / switched user while in flight
-    if (seq === writeSeq && state.pendingWrites === 0) {
-      Object.assign(state, s);
-    } else {
-      // A write raced this snapshot: server rows underneath, local rows on top.
-      const trophy = { ...s.trophy };
-      if (state.trophy[uid]) {
-        trophy[uid] = { ...(s.trophy[uid] ?? {}),
-          ...Object.fromEntries(Object.entries(state.trophy[uid]).filter(([, v]) => v != null)) };
-      }
-      Object.assign(state, {
-        ballots: s.ballots, profiles: s.profiles,
-        picks: { ...s.picks, ...state.picks },
-        submissions: { ...s.submissions, ...state.submissions },
-        trophy,
-      });
-    }
+    state.now = new Date(); // ballotState() must judge drafts with the current time
+    if (seq !== loadSeq || myId() !== uid) return; // a newer load started / user switched
+    Object.assign(state, s);
+    applyDrafts();
     state.stateLoaded = true;
   } catch (e) {
-    if (myId() !== uid) return;
+    if (seq !== loadSeq || myId() !== uid) return;
     console.warn('state load failed', e);
     if (loggedOut(e)) {
       state.picks = {}; state.submissions = {}; state.trophy = {};
@@ -901,6 +896,31 @@ async function loadState() {
       toast('No connection — retrying');
     }
   }
+}
+
+// Unsubmitted picks live in this browser: lay them over the server snapshot.
+// A draft for a phase the server shows as submitted is dead (the submitted
+// rows win) and is dropped; a draft for a locked phase counts for nothing.
+function applyDrafts() {
+  const uid = myId();
+  if (!uid || !online()) return;
+  const d = loadDraft();
+  const byNum = new Map(state.matches.map(m => [m.num, m]));
+  const dead = [];
+  for (const [num, pick] of Object.entries(d.picks)) {
+    const m = byNum.get(Number(num));
+    if (!m || !inBallot(m)) continue;
+    const st = ballotState(m.phase);
+    if (st === 'submitted') { dead.push(num); continue; }
+    if (st === 'open') state.picks[`${num}:${uid}`] = pick;
+  }
+  const hasTrophy = Boolean(d.trophy.champion || d.trophy.top_scorer);
+  const league = ballotState('league');
+  if (league === 'open' && hasTrophy) {
+    state.trophy[uid] = { champion: null, top_scorer: null, ...(state.trophy[uid] ?? {}), ...d.trophy };
+  }
+  const deadTrophy = hasTrophy && league === 'submitted';
+  if (dead.length || deadTrophy) clearDraft(dead, { trophy: deadTrophy });
 }
 
 /* ---------- boot ---------- */
