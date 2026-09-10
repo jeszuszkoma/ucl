@@ -204,7 +204,11 @@ nav { display: flex; gap: 6px; margin-top: 10px; }
   transition: all 0.15s ease; white-space: nowrap; min-width: 0;
 }
 .vote-btn .vlabel { display: block; overflow: hidden; text-overflow: ellipsis; }
-.vote-btn:not(:disabled):hover { color: var(--cyan); border-color: var(--line); }
+/* Hover only on devices that really hover: on touch screens the tapped button
+   keeps :hover, and cyan text on the cyan .mine background is invisible. */
+@media (hover: hover) {
+  .vote-btn:not(:disabled):not(.mine):hover { color: var(--cyan); border-color: var(--line); }
+}
 .vote-btn.mine {
   color: #021016; background: var(--cyan); border-color: var(--cyan);
   box-shadow: 0 0 16px rgba(0, 229, 255, 0.4);
@@ -289,7 +293,9 @@ nav { display: flex; gap: 6px; margin-top: 10px; }
   white-space: nowrap; overflow: hidden;
 }
 .champ-btn span:last-child { overflow: hidden; text-overflow: ellipsis; }
-.champ-btn:not(:disabled):hover { border-color: var(--line); color: var(--cyan); }
+@media (hover: hover) {
+  .champ-btn:not(:disabled):not(.mine):hover { border-color: var(--line); color: var(--cyan); }
+}
 .champ-btn:disabled { cursor: default; opacity: 0.55; }
 .champ-btn.mine {
   color: #021016; background: var(--cyan); border-color: var(--cyan);
