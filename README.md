@@ -10,9 +10,10 @@ points when you're right, top the board.
 
 ## How the game works
 
-- **Accounts:** register with email + username + password + invite code, confirm
-  the email, log in with username (or email) + password. Username is what the
-  board shows. Emails stay private.
+- **Accounts:** register with email + username + password + invite code (no
+  email confirmation — you are logged in straight away), later log in with
+  username (or email) + password. Username is what the board shows. Emails
+  stay private and are only used for password resets.
 - **League ballot:** all 126 remaining league-phase matches (Matchday 2–8; MD1
   was played before launch). Pick every match, press **SUBMIT** — final. Picks
   stay in your browser until you submit (one request per ballot, not one per

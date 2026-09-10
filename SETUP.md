@@ -32,31 +32,37 @@ the CLI after `npx supabase@latest link --project-ref wwbovzfjoiuxzfehkqut`:
 
 ## 2. Auth settings (Supabase dashboard → Authentication)
 
-- **Providers → Email:** enabled, **Confirm email** ON.
+- **Providers → Email:** enabled, **Confirm email** OFF
+  (`enable_confirmations = false`): people are logged in the moment the
+  account is created. Reason: Supabase's built-in mailer sends only ~2 emails
+  per hour project-wide, which would leave most of a signup wave waiting for a
+  confirmation link. The invite code is what gates registration.
 - **URL Configuration → Site URL / Redirect URLs:** declared in
   [`supabase/config.toml`](supabase/config.toml) together with the rate limits
   and *Confirm email*. Apply them with `npx supabase@latest config push`
   (`config diff` previews; undeclared dashboard settings are left alone).
-  Confirmation and reset links send people back to the site URL.
-- **Rate limits / SMTP:** Supabase's built-in mailer allows only a couple of
-  emails per hour — enough to test, not for a signup wave. Before inviting
-  people, set up **custom SMTP** (Project Settings → Authentication → SMTP):
-  a free [Resend](https://resend.com) or [Brevo](https://www.brevo.com) account
-  works (Resend: 3000 emails/month free; needs a verified sender domain or
-  their onboarding sender).
+  Reset links (and confirmation links, if enabled) send people back to the
+  site URL.
+- **SMTP:** password-reset mails still go through the built-in mailer, ~2 per
+  hour — fine for a friend group. If you want confirmation emails after all,
+  set up **custom SMTP** first (Project Settings → Authentication → SMTP; a
+  free [Resend](https://resend.com) or [Brevo](https://www.brevo.com) account
+  works, or Gmail with an app password), raise the email rate limit, then set
+  `enable_confirmations = true` and push the config again. The app handles
+  both modes.
 - **Rate Limits:** raise *Token refresh / sign-in* well above your player count
   (username logins pass through the edge function, so Supabase sees them from
-  one IP). Email links expire after 1 h by default — players who miss it use
-  "Resend confirmation" on the login screen.
+  one IP). Email links expire after 1 h by default — with confirmations on,
+  players who miss it use "Resend confirmation" on the login screen.
 - Optional: **Email Templates** — customise the confirmation / reset text.
 - **Do not create players from the dashboard** (*Invite user* / *Add user*):
   those rows carry no username or invite code and the signup trigger rejects
   them by design. Everyone registers through the app with the invite code.
   Rename someone with
   `update public.profiles set username = 'Name' where username = 'old';`.
-- **Registration that never got confirmed** (typo in the email, link expired)
-  frees its username automatically after 1 hour, so the person can simply
-  register again.
+- **Registration that never got confirmed** (only with *Confirm email* on:
+  typo in the email, link expired) frees its username automatically after
+  1 hour, so the person can simply register again.
 
 ## 3. Username login (edge function, ~5 min)
 

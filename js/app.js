@@ -503,22 +503,44 @@ function scorerRaceCard() {
   </section>`;
 }
 
+// Rules card (Hungarian on purpose: the friend group reads it, the rest of
+// the UI stays English). Deadlines come from the live ballots table.
 function scoringLegend() {
+  const hu = phase => {
+    const b = ballot(phase);
+    return b ? new Date(b.locks_at).toLocaleString('hu-HU', { month: 'long', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : '—';
+  };
+  const league = hu('league'), champ = hu('champion'), scorer = hu('scorer');
+  const deadline = champ === league && scorer === league
+    ? `<b>${league}</b> (2. forduló kezdete) — mindhárom szavazólapra.`
+    : `alapszakasz <b>${league}</b> · BL-győztes <b>${champ}</b> · gólkirály <b>${scorer}</b>.`;
   return `
   <section class="special-card rules-card">
-    <h2 class="group-head">📐 SCORING</h2>
+    <h2 class="group-head">📜 JÁTÉKSZABÁLY</h2>
     <div class="rule-row"><span class="rule-ico">✓</span>
-      <span class="rule-lab">Correct result — 1 / X / 2 (final: winner)</span>
-      <span class="rule-pts">${CONFIG.POINTS_MATCH} pts</span></div>
+      <span class="rule-lab">Eltalált eredmény — 1 / X / 2 (döntő: a győztes)</span>
+      <span class="rule-pts">${CONFIG.POINTS_MATCH} pont</span></div>
     <div class="rule-row"><span class="rule-ico">🏆</span>
-      <span class="rule-lab">Champions League winner — Trophy tab</span>
-      <span class="rule-pts">${CONFIG.POINTS_CHAMPION} pts</span></div>
+      <span class="rule-lab">BL-győztes — Trophy fül</span>
+      <span class="rule-pts">${CONFIG.POINTS_CHAMPION} pont</span></div>
     <div class="rule-row"><span class="rule-ico">👑</span>
-      <span class="rule-lab">Gólkirály (top scorer) — Trophy tab</span>
-      <span class="rule-pts">${CONFIG.POINTS_TOP_SCORER} pts</span></div>
-    <p class="special-note">Three ballots to start: the league matches, the winner and the gólkirály — each with its
-      own SUBMIT. Knockout rounds get their own ballot later. Only submitted ballots count; picks stay
-      on this device until you submit. Everyone's picks stay hidden until the ballot locks.</p>
+      <span class="rule-lab">Gólkirály — Trophy fül</span>
+      <span class="rule-pts">${CONFIG.POINTS_TOP_SCORER} pont</span></div>
+    <p class="special-note"><b>Három szavazólap</b> az induláshoz: az alapszakasz 126 meccse (2–8. forduló),
+      a BL-győztes és a gólkirály. Mindegyiket külön SUBMIT gombbal kell beküldeni. A kieséses körök
+      később kapnak saját szavazólapot.</p>
+    <p class="special-note"><b>Határidő:</b> ${deadline}</p>
+    <p class="special-note"><b>Beküldésig</b> a tippek csak ebben a böngészőben vannak elmentve, több
+      részletben is kitöltheted — de ugyanazon az eszközön fejezd be, ahol elkezdted. A SUBMIT egy lépésben
+      küldi be az egész szavazólapot.</p>
+    <p class="special-note"><b>A beküldés végleges</b>, utána nem módosítható. Csak a beküldött szavazólap
+      számít: ami a határidőig nincs beküldve, az nem ér pontot.</p>
+    <p class="special-note"><b>Mindenki tippje rejtve</b> marad a szavazólap lezárásáig, utána mindenki
+      látja a többiekét.</p>
+    <p class="special-note"><b>Kieséses szakasz:</b> oda-visszavágónál a meccs eredménye számít, a hosszabbítással
+      együtt; a tizenegyespárbaj nem. A döntőben a győztest kell eltalálni.</p>
+    <p class="special-note"><b>Gólkirály:</b> a sorozat végén a legtöbb gólt szerző játékos; holtverseny
+      esetén bármelyikük jó. Öngól és tizenegyespárbaj nem számít.</p>
   </section>`;
 }
 
@@ -609,7 +631,7 @@ function renderAuth() {
       ${field('a-pass', 'Password (min 6)', 'password', '', 'new-password')}
       ${field('a-invite', 'Invite code', 'text')}
       ${err}<button id="a-register" ${busy}>CREATE ACCOUNT</button>
-      <p class="modal-hint">You'll get a confirmation email. Click the link, then log in.<br>
+      <p class="modal-hint">Ask the organiser for the invite code. You're logged in as soon as the account exists.<br>
       <a href="#" data-auth="login">Back to log in</a></p>`;
   } else if (mode === 'forgot') {
     body = `<h2>RESET PASSWORD</h2>
