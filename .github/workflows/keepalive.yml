@@ -1,0 +1,22 @@
+# Supabase pauses a free-tier project after 7 days without API requests, and
+# the paused project took the whole game down in October 2026. One public
+# read per day keeps it awake between matchdays (the anon key is public by
+# design; row-level security decides what it can see — only the deadlines).
+name: Keep Supabase awake
+
+on:
+  schedule:
+    - cron: '17 6 * * *'
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Read the public ballot deadlines
+        run: |
+          code=$(curl -s -o /dev/null -w '%{http_code}' \
+            -H 'apikey: sb_publishable_t-CWzc_hRSDsW2Y8ebJQPA_ao7gx8cn' \
+            'https://wwbovzfjoiuxzfehkqut.supabase.co/rest/v1/ballots?select=phase')
+          echo "HTTP $code"
+          test "$code" = "200"
