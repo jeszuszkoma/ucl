@@ -23,7 +23,8 @@ import { readFileSync, writeFileSync, existsSync } from 'node:fs';
 
 const LEAGUE = 'uefa.champions';
 const BASE = `https://site.api.espn.com/apis/site/v2/sports/soccer/${LEAGUE}`;
-const WINDOWS = ['20260901-20270131', '20270201-20270630']; // league phase, knockouts
+// Month by month: ESPN rejects "YYYYMMDD-YYYYMMDD" ranges (400) since Oct 2026.
+const WINDOWS = ['202609', '202610', '202611', '202612', '202701', '202702', '202703', '202704', '202705', '202706'];
 const OUT = new URL('../data/ucl2027.json', import.meta.url);
 
 // ESPN season.slug -> [round label, ballot phase]

@@ -12,8 +12,11 @@ export const PHASE_LABEL = {
 
 const ESPN = 'https://site.api.espn.com/apis/site/v2/sports/soccer/uefa.champions';
 const ESPN_STANDINGS = 'https://site.api.espn.com/apis/v2/sports/soccer/uefa.champions/standings';
-// Full-season windows (league phase, knockouts). limit= lifts ESPN's 100-event cap.
-const FULL_WINDOWS = ['20260901-20270131', '20270201-20270630'];
+// ESPN stopped accepting "YYYYMMDD-YYYYMMDD" date ranges (HTTP 400 since
+// October 2026). Single days and whole months ("YYYYMM") still work, so every
+// pull goes month by month. limit= lifts ESPN's 100-event cap.
+const SEASON_MONTHS = ['202609', '202610', '202611', '202612', '202701', '202702', '202703', '202704', '202705', '202706'];
+const ym = d => d.toISOString().slice(0, 7).replace('-', '');
 
 // ------------------------------------------------------------ match helpers
 
@@ -106,10 +109,17 @@ async function espnJson(url) {
   return JSON.parse(txt.replace(CTRL, ' '));
 }
 
-// yesterday..tomorrow as "YYYYMMDD-YYYYMMDD" - catches venue-timezone drift.
-function nearDates(now = new Date()) {
-  const fmt = d => d.toISOString().slice(0, 10).replaceAll('-', '');
-  return `${fmt(new Date(now - 86_400_000))}-${fmt(new Date(+now + 86_400_000))}`;
+// Months covering yesterday..tomorrow (UTC) - one request, two around a month
+// boundary. Catches venue-timezone drift the way the old 3-day range did.
+function nearMonths(now = new Date()) {
+  return [...new Set([ym(new Date(now - 86_400_000)), ym(new Date(+now + 86_400_000))])];
+}
+
+// Every season month plus any month a match of ours was moved into.
+function fullMonths(matches) {
+  const set = new Set(SEASON_MONTHS);
+  for (const m of matches) for (const d of [m.date, m.espnDate]) if (d) set.add(d.slice(0, 7).replace('-', ''));
+  return [...set].sort();
 }
 
 // Pulls are serialised (the 10-minute full pull and the 60-second near pull
@@ -125,9 +135,8 @@ export function refreshScores(matches, opts = {}) {
 }
 
 async function doRefresh(matches, { full = false } = {}) {
-  const urls = full
-    ? FULL_WINDOWS.map(w => `${ESPN}/scoreboard?dates=${w}&limit=1000`)
-    : [`${ESPN}/scoreboard?dates=${nearDates()}&limit=500`];
+  const months = full ? fullMonths(matches) : nearMonths();
+  const urls = months.map(m => `${ESPN}/scoreboard?dates=${m}&limit=1000`);
   let changed = false;
   for (const url of urls) {
     const at = ++pullSeq;
