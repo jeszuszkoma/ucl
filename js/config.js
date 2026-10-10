@@ -8,7 +8,7 @@ export const CONFIG = {
   // Empty = login with email only, straight against Supabase Auth.
   LOGIN_URL: 'https://wwbovzfjoiuxzfehkqut.supabase.co/functions/v1/login',
   // Where confirmation / password-reset emails send people back to.
-  SITE_URL: 'https://jeszuszkoma.github.io/wc26/',
+  SITE_URL: 'https://jeszuszkoma.github.io/ucl/',
 
   // Points.
   POINTS_MATCH: 3,        // correct 1 / X / 2 (league and knockout alike)

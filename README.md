@@ -4,7 +4,7 @@ Friends prediction game for the 2026/27 UEFA Champions League. Real accounts,
 one ballot per phase: pick `1 / X / 2` for every match, press SUBMIT, score
 points when you're right, top the board.
 
-**Live:** https://jeszuszkoma.github.io/wc26/
+**Live:** https://jeszuszkoma.github.io/ucl/
 
 > Started life as the World Cup 2026 game (see git history before Sept 2026).
 

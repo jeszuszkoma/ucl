@@ -1,11 +1,11 @@
 # Only the properties declared here are pushed (`supabase config push`);
 # everything else in the hosted project stays as it is. Preview with
 # `supabase config diff`. SMTP must still be set in the dashboard.
-project_id = "wc26"
+project_id = "ucl"
 
 [auth]
-site_url = "https://jeszuszkoma.github.io/wc26/"
-additional_redirect_urls = ["https://jeszuszkoma.github.io/wc26/", "http://localhost:8087/"]
+site_url = "https://jeszuszkoma.github.io/ucl/"
+additional_redirect_urls = ["https://jeszuszkoma.github.io/ucl/", "http://localhost:8087/"]
 
 [auth.email]
 enable_signup = true
